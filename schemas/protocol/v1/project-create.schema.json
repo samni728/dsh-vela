@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dsh-novel.local/schemas/protocol/v1/project-create.schema.json",
+  "title": "Create Project Request",
+  "type": "object",
+  "required": ["title"],
+  "properties": {
+    "title": {"type": "string", "minLength": 1, "maxLength": 200},
+    "premise": {"type": "string", "maxLength": 20000},
+    "target_chapters": {"type": "integer", "minimum": 1, "maximum": 3000},
+    "hard_rules": {"type": "array", "items": {"type": "string"}},
+    "story_spine": {"type": "object"},
+    "project_id": {
+      "type": ["string", "null"],
+      "pattern": "^[a-zA-Z0-9_-]{3,64}$"
+    }
+  },
+  "additionalProperties": false
+}
+

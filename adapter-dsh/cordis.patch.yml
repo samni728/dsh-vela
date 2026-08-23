@@ -1,0 +1,10 @@
+- insert:
+    - id: dsh-novel
+      name: dsh-novel-plugin
+      config:
+        endpoint: http://127.0.0.1:17861
+        tokenEnv: DSH_NOVEL_TOKEN
+        requestTimeoutMs: 30000
+        handshakeTimeoutMs: 5000
+        maxRenderChars: 20000
+        requireHandshake: true

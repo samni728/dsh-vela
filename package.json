@@ -1,0 +1,62 @@
+{
+  "name": "dsh-novel-plugin",
+  "version": "0.1.0",
+  "description": "Local-first long-form novel writing plugin for DeepSeek Harness",
+  "type": "module",
+  "main": "adapter-dsh/lib/index.js",
+  "types": "adapter-dsh/lib/index.d.ts",
+  "files": [
+    "adapter-dsh/lib",
+    "adapter-dsh/cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p adapter-dsh/tsconfig.build.json",
+    "check": "tsc -p adapter-dsh/tsconfig.json --noEmit",
+    "test": "vitest run adapter-dsh/tests",
+    "prepare": "npm run build",
+    "prepack": "npm run build"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./adapter-dsh/cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20.11"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-tools": "0.1.1-rc.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-tools": "0.1.1-rc.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.4"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/samni728/dsh-vela.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "novel",
+    "plugin",
+    "local-llm"
+  ]
+}

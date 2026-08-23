@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dsh-novel.local/schemas/protocol/v1/chapter-run.schema.json",
+  "title": "Run Chapter Request",
+  "type": "object",
+  "properties": {
+    "idempotency_key": {"type": ["string", "null"], "minLength": 8, "maxLength": 128},
+    "contract": {
+      "type": ["object", "null"],
+      "required": ["chapter_number", "title", "purpose"],
+      "properties": {
+        "chapter_number": {"type": "integer", "minimum": 1},
+        "title": {"type": "string", "minLength": 1, "maxLength": 200},
+        "purpose": {"type": "string", "minLength": 1},
+        "required_events": {"type": "array", "items": {"type": "string"}},
+        "required_state_changes": {"type": "array", "items": {"type": "object"}},
+        "forbidden_changes": {"type": "array", "items": {"type": "object"}},
+        "hooks_to_plant": {"type": "array", "items": {"type": "string"}},
+        "hooks_to_advance": {"type": "array", "items": {"type": "string"}},
+        "handoff": {"type": "string"},
+        "target_words": {"type": "integer", "minimum": 100, "maximum": 20000}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dsh-novel.local/schemas/protocol/v1/envelope.schema.json",
+  "title": "DSH Novel API Envelope",
+  "type": "object",
+  "required": [
+    "ok",
+    "request_id",
+    "project_id",
+    "run_id",
+    "protocol_version",
+    "result",
+    "warnings",
+    "error"
+  ],
+  "properties": {
+    "ok": {"type": "boolean"},
+    "request_id": {"type": "string", "pattern": "^req_"},
+    "project_id": {"type": ["string", "null"]},
+    "run_id": {"type": ["string", "null"]},
+    "protocol_version": {"const": "1.0"},
+    "result": {},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "error": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["code", "message"],
+          "properties": {
+            "code": {"type": "string"},
+            "message": {"type": "string"},
+            "details": {}
+          },
+          "additionalProperties": true
+        }
+      ]
+    }
+  },
+  "additionalProperties": true
+}
+

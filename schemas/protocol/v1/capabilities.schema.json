@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dsh-novel.local/schemas/protocol/v1/capabilities.schema.json",
+  "title": "DSH Novel Capability Handshake",
+  "type": "object",
+  "required": ["protocol_version", "core_version", "capabilities"],
+  "properties": {
+    "protocol_version": {"const": "1.0"},
+    "core_version": {"type": "string"},
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "project.create",
+          "project.status",
+          "chapter.run",
+          "run.status",
+          "run.resume",
+          "manuscript.export"
+        ]
+      },
+      "minItems": 6,
+      "uniqueItems": true
+    },
+    "optional_capabilities": {
+      "type": "object",
+      "properties": {
+        "embedding": {"type": "boolean"},
+        "rerank": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
+

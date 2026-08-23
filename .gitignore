@@ -18,6 +18,8 @@ build/
 node_modules/
 coverage/
 *.tsbuildinfo
+adapter-dsh/lib/
+*.tgz
 
 # Local runtime data and secrets
 .env
@@ -30,4 +32,3 @@ data/
 *.sqlite
 *.sqlite3
 *.log
-
