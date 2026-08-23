@@ -73,6 +73,7 @@ uv run dsh-novel serve
 | `DSH_NOVEL_MODEL_TIMEOUT` | `180` | 模型请求超时秒数 |
 | `DSH_NOVEL_MODEL_MAX_OUTPUT_TOKENS` | `8192` | 单次最大输出 |
 | `DSH_NOVEL_CONTEXT_TOKEN_BUDGET` | `20000` | 编译上下文硬预算 |
+| `DSH_NOVEL_TOKEN` | 未设置 | 可选的 Sidecar Bearer token；Sidecar 和 Harness 进程需使用相同值 |
 
 ## 2. 先用 HTTP 跑通一章
 
@@ -116,9 +117,13 @@ pnpm dsh --profile novel
 dsh plugin --profile novel add github:samni728/dsh-vela
 ```
 
-Git 安装需要在安装期间构建 TypeScript。pnpm 10+ 会默认拦截依赖的 `prepare` 脚本；请只在你信任本仓库时，按 Harness 错误信息把它给出的精确 package key 加到对应 profile 的 `pnpm-workspace.yaml` `allowBuilds` 中，然后重试。
+GitHub 安装直接使用仓库中随版本提交的已编译 Adapter，不需要在安装期间授权 `prepare` 构建脚本。在正式环境中建议锁定已验证的 commit：
 
-如果不希望授权 git build，可在信任的本地 checkout 构建 tarball：
+```bash
+dsh plugin --profile novel add github:samni728/dsh-vela#<commit>
+```
+
+也可在信任的本地 checkout 构建 tarball：
 
 ```bash
 cd dsh-vela
@@ -142,6 +147,8 @@ dsh plugin --profile novel add ./dsh-novel-plugin-0.1.0.tgz
     maxRenderChars: 20000
     requireHandshake: true
 ```
+
+如果设置 `DSH_NOVEL_TOKEN`，请在启动 Sidecar 和 DeepSeek Harness 的两个进程中提供相同值。Sidecar 将校验所有 `/api/*` 请求；`/health` 仍保留为不含敏感数据的本机存活检查。
 
 ## Harness 工具
 

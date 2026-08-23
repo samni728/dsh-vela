@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -106,6 +107,21 @@ def create_app(
     )
     app.state.settings = settings
     app.state.service = service
+
+    @app.middleware("http")
+    async def authenticate_api(request: Request, call_next):  # type: ignore[no-untyped-def]
+        if settings.auth_token is not None and request.url.path.startswith("/api/"):
+            supplied = request.headers.get("authorization", "")
+            expected = f"Bearer {settings.auth_token}"
+            if not secrets.compare_digest(supplied, expected):
+                return JSONResponse(
+                    status_code=401,
+                    content=error_envelope(
+                        "AUTH_REQUIRED",
+                        "a valid DSH Novel bearer token is required",
+                    ),
+                )
+        return await call_next(request)
 
     @app.exception_handler(NovelError)
     def handle_novel_error(_request: Request, exc: NovelError) -> JSONResponse:

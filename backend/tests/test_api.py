@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 from fastapi.testclient import TestClient
+
+from dsh_novel.config import Settings
+from dsh_novel.transports.http import create_app
 
 
 def create_project(client: TestClient, project_id: str = "test_project") -> str:
@@ -132,3 +136,19 @@ def test_validation_error_uses_protocol_envelope(client: TestClient) -> None:
     assert payload["ok"] is False
     assert payload["error"]["code"] == "CONFIG_INVALID"
 
+
+def test_optional_bearer_token_protects_api(tmp_path: Path) -> None:
+    app = create_app(Settings(data_dir=tmp_path / "auth", auth_token="local-secret"))
+    with TestClient(app) as protected:
+        assert protected.get("/health").status_code == 200
+
+        denied = protected.get("/api/v1/capabilities")
+        assert denied.status_code == 401
+        assert denied.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        allowed = protected.get(
+            "/api/v1/capabilities",
+            headers={"Authorization": "Bearer local-secret"},
+        )
+        assert allowed.status_code == 200
+        assert "chapter.run" in allowed.json()["capabilities"]

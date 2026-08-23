@@ -35,10 +35,12 @@ class Settings:
     context_token_budget: int = field(
         default_factory=lambda: int(os.getenv("DSH_NOVEL_CONTEXT_TOKEN_BUDGET", "20000"))
     )
+    auth_token: str | None = field(
+        default_factory=lambda: os.getenv("DSH_NOVEL_TOKEN") or None
+    )
     host: str = "127.0.0.1"
     port: int = field(default_factory=lambda: int(os.getenv("DSH_NOVEL_PORT", "17861")))
 
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "projects").mkdir(exist_ok=True)
-
