@@ -1,6 +1,6 @@
 {
   "name": "dsh-novel-plugin",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Local-first long-form novel writing plugin for DeepSeek Harness",
   "type": "module",
   "main": "adapter-dsh/lib/index.js",

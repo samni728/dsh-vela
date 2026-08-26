@@ -1,6 +1,6 @@
 {
   "name": "dsh-novel-plugin",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Thin DeepSeek Harness adapter for the DSH Novel local sidecar",
   "type": "module",
   "main": "lib/index.js",

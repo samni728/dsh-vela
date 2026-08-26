@@ -3,7 +3,7 @@ export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue }
 export type JsonObject = { [key: string]: JsonValue }
 
-export const ADAPTER_VERSION = '0.1.0'
+export const ADAPTER_VERSION = '0.3.0'
 export const SUPPORTED_PROTOCOL_MAJOR = 1
 
 export const REQUIRED_CAPABILITIES = [

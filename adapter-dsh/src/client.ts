@@ -17,17 +17,54 @@ interface RequestOptions {
   timeoutMs?: number | undefined
 }
 
+/**
+ * Partial per-project writing policy accepted by the autorun and auto-create
+ * endpoints. Omitted fields are never serialized into the request body; the
+ * Sidecar then falls back to stored project policy and its own defaults.
+ */
+export interface NovelPolicyInput {
+  score_threshold?: number | undefined
+  max_revisions?: number | undefined
+  target_words?: number | undefined
+  on_chapter_failure?: 'skip_continue' | 'pause' | undefined
+}
+
+/**
+ * Drop unset (undefined/null) policy fields so omitted keys never reach the
+ * Sidecar, and collapse an effectively empty policy to `undefined` so the
+ * whole `policy` key disappears from the body.
+ */
+export function compactPolicy(policy: NovelPolicyInput | undefined): JsonObject | undefined {
+  if (policy === undefined) return undefined
+  const entries = Object.entries(policy).filter((entry): entry is [string, JsonValue] => {
+    const value = entry[1]
+    return value !== undefined && value !== null
+  })
+  return entries.length === 0 ? undefined : Object.fromEntries(entries)
+}
+
+/** Spreadable `{ policy }` body fragment; empty when no policy fields are set. */
+function compactPolicyObject(policy: NovelPolicyInput | undefined): JsonObject {
+  const compacted = compactPolicy(policy)
+  return compacted === undefined ? {} : { policy: compacted }
+}
+
 /** All Sidecar paths live here so a protocol revision does not leak into tools. */
 export const routes = {
   health: '/health',
   capabilities: '/api/v1/capabilities',
   projects: '/api/v1/projects',
   project: (projectId: string) => `/api/v1/projects/${encodeURIComponent(projectId)}`,
+  outline: (projectId: string) => `/api/v1/projects/${encodeURIComponent(projectId)}/outline`,
   chapterRun: (projectId: string, chapterNumber: number) =>
     `/api/v1/projects/${encodeURIComponent(projectId)}/chapters/${chapterNumber}/run`,
   run: (runId: string) => `/api/v1/runs/${encodeURIComponent(runId)}`,
   runResume: (runId: string) => `/api/v1/runs/${encodeURIComponent(runId)}/resume`,
+  autorun: (projectId: string) => `/api/v1/projects/${encodeURIComponent(projectId)}/autorun`,
+  pipeline: (projectId: string) => `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline`,
+  projectReport: (projectId: string) => `/api/v1/projects/${encodeURIComponent(projectId)}/report`,
   manuscriptExport: (projectId: string) => `/api/v1/projects/${encodeURIComponent(projectId)}/export`,
+  auto: '/api/v1/auto',
 } as const
 
 export class NovelClient {
@@ -70,6 +107,48 @@ export class NovelClient {
 
   projectStatus(projectId: string, signal?: AbortSignal): Promise<NovelEnvelope> {
     return this.request(routes.project(projectId), { signal })
+  }
+
+  generateOutline(projectId: string, signal?: AbortSignal): Promise<NovelEnvelope> {
+    return this.request(routes.outline(projectId), { method: 'POST', body: {}, signal })
+  }
+
+  startAutorun(
+    projectId: string,
+    fromChapter?: number,
+    toChapter?: number,
+    policy?: NovelPolicyInput | undefined,
+    signal?: AbortSignal,
+  ): Promise<NovelEnvelope> {
+    return this.request(routes.autorun(projectId), {
+      method: 'POST',
+      body: {
+        ...(fromChapter === undefined ? {} : { from_chapter: fromChapter }),
+        ...(toChapter === undefined ? {} : { to_chapter: toChapter }),
+        ...compactPolicyObject(policy),
+      },
+      signal,
+    })
+  }
+
+  autorunStatus(projectId: string, signal?: AbortSignal): Promise<NovelEnvelope> {
+    return this.request(routes.autorun(projectId), { signal })
+  }
+
+  /**
+   * Zero-prose management snapshot (`GET /pipeline`): scores, statuses and
+   * counters only. The Sidecar contract guarantees no manuscript content.
+   */
+  pipelineStatus(projectId: string, signal?: AbortSignal): Promise<NovelEnvelope> {
+    return this.request(routes.pipeline(projectId), { signal })
+  }
+
+  report(projectId: string, signal?: AbortSignal): Promise<NovelEnvelope> {
+    return this.request(routes.projectReport(projectId), { signal })
+  }
+
+  autoCreate(input: JsonObject, signal?: AbortSignal): Promise<NovelEnvelope> {
+    return this.request(routes.auto, { method: 'POST', body: input, signal })
   }
 
   runChapter(projectId: string, chapterNumber: number, input: JsonObject, signal?: AbortSignal): Promise<NovelEnvelope> {
@@ -169,6 +248,37 @@ export class NovelClient {
       this.#active.delete(controller)
     }
   }
+}
+
+/**
+ * Tool-facing subset of the Sidecar API. `registerNovelTools` depends on this
+ * shape instead of the concrete client so decorators (the lazy handshake
+ * wrapper) can stand in for a NovelClient.
+ */
+export interface NovelSidecar {
+  createProject(input: JsonObject, signal?: AbortSignal): Promise<NovelEnvelope>
+  projectStatus(projectId: string, signal?: AbortSignal): Promise<NovelEnvelope>
+  generateOutline(projectId: string, signal?: AbortSignal): Promise<NovelEnvelope>
+  startAutorun(
+    projectId: string,
+    fromChapter: number | undefined,
+    toChapter: number | undefined,
+    policy: NovelPolicyInput | undefined,
+    signal?: AbortSignal,
+  ): Promise<NovelEnvelope>
+  autorunStatus(projectId: string, signal?: AbortSignal): Promise<NovelEnvelope>
+  pipelineStatus(projectId: string, signal?: AbortSignal): Promise<NovelEnvelope>
+  report(projectId: string, signal?: AbortSignal): Promise<NovelEnvelope>
+  autoCreate(input: JsonObject, signal?: AbortSignal): Promise<NovelEnvelope>
+  runChapter(
+    projectId: string,
+    chapterNumber: number,
+    input: JsonObject,
+    signal?: AbortSignal,
+  ): Promise<NovelEnvelope>
+  runStatus(runId: string, signal?: AbortSignal): Promise<NovelEnvelope>
+  resumeRun(runId: string, forceRedraft: boolean, signal?: AbortSignal): Promise<NovelEnvelope>
+  exportManuscript(projectId: string, format: string, signal?: AbortSignal): Promise<NovelEnvelope>
 }
 
 function normalizeEndpoint(endpoint: string): string {

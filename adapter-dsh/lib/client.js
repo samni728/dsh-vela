@@ -1,16 +1,40 @@
 import { randomUUID } from 'node:crypto';
 import { ADAPTER_VERSION, isJsonObject, isJsonValue, isNovelEnvelope } from './protocol.js';
 import { NovelAdapterError } from './errors.js';
+/**
+ * Drop unset (undefined/null) policy fields so omitted keys never reach the
+ * Sidecar, and collapse an effectively empty policy to `undefined` so the
+ * whole `policy` key disappears from the body.
+ */
+export function compactPolicy(policy) {
+    if (policy === undefined)
+        return undefined;
+    const entries = Object.entries(policy).filter((entry) => {
+        const value = entry[1];
+        return value !== undefined && value !== null;
+    });
+    return entries.length === 0 ? undefined : Object.fromEntries(entries);
+}
+/** Spreadable `{ policy }` body fragment; empty when no policy fields are set. */
+function compactPolicyObject(policy) {
+    const compacted = compactPolicy(policy);
+    return compacted === undefined ? {} : { policy: compacted };
+}
 /** All Sidecar paths live here so a protocol revision does not leak into tools. */
 export const routes = {
     health: '/health',
     capabilities: '/api/v1/capabilities',
     projects: '/api/v1/projects',
     project: (projectId) => `/api/v1/projects/${encodeURIComponent(projectId)}`,
+    outline: (projectId) => `/api/v1/projects/${encodeURIComponent(projectId)}/outline`,
     chapterRun: (projectId, chapterNumber) => `/api/v1/projects/${encodeURIComponent(projectId)}/chapters/${chapterNumber}/run`,
     run: (runId) => `/api/v1/runs/${encodeURIComponent(runId)}`,
     runResume: (runId) => `/api/v1/runs/${encodeURIComponent(runId)}/resume`,
+    autorun: (projectId) => `/api/v1/projects/${encodeURIComponent(projectId)}/autorun`,
+    pipeline: (projectId) => `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline`,
+    projectReport: (projectId) => `/api/v1/projects/${encodeURIComponent(projectId)}/report`,
     manuscriptExport: (projectId) => `/api/v1/projects/${encodeURIComponent(projectId)}/export`,
+    auto: '/api/v1/auto',
 };
 export class NovelClient {
     endpoint;
@@ -47,6 +71,36 @@ export class NovelClient {
     }
     projectStatus(projectId, signal) {
         return this.request(routes.project(projectId), { signal });
+    }
+    generateOutline(projectId, signal) {
+        return this.request(routes.outline(projectId), { method: 'POST', body: {}, signal });
+    }
+    startAutorun(projectId, fromChapter, toChapter, policy, signal) {
+        return this.request(routes.autorun(projectId), {
+            method: 'POST',
+            body: {
+                ...(fromChapter === undefined ? {} : { from_chapter: fromChapter }),
+                ...(toChapter === undefined ? {} : { to_chapter: toChapter }),
+                ...compactPolicyObject(policy),
+            },
+            signal,
+        });
+    }
+    autorunStatus(projectId, signal) {
+        return this.request(routes.autorun(projectId), { signal });
+    }
+    /**
+     * Zero-prose management snapshot (`GET /pipeline`): scores, statuses and
+     * counters only. The Sidecar contract guarantees no manuscript content.
+     */
+    pipelineStatus(projectId, signal) {
+        return this.request(routes.pipeline(projectId), { signal });
+    }
+    report(projectId, signal) {
+        return this.request(routes.projectReport(projectId), { signal });
+    }
+    autoCreate(input, signal) {
+        return this.request(routes.auto, { method: 'POST', body: input, signal });
     }
     runChapter(projectId, chapterNumber, input, signal) {
         return this.request(routes.chapterRun(projectId, chapterNumber), { method: 'POST', body: input, signal });

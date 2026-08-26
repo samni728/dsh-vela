@@ -31,6 +31,50 @@ describe('NovelClient', () => {
     expect(fetchMock).toHaveBeenCalledOnce()
   })
 
+  it('serializes only the provided autorun policy fields into the request body', async () => {
+    const bodies: unknown[] = []
+    const fetchMock = mockFetch(async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body ?? 'null')))
+      return jsonResponse({ status: 'ok' }, 200, { 'x-protocol-version': '1.0' })
+    })
+    const client = new NovelClient({
+      endpoint: 'http://localhost:17861',
+      timeoutMs: 1_000,
+      fetch: fetchMock,
+    })
+
+    await client.startAutorun('prj_1', 2, 5, { score_threshold: 8.5 })
+    expect(bodies[0]).toEqual({ from_chapter: 2, to_chapter: 5, policy: { score_threshold: 8.5 } })
+
+    await client.startAutorun('prj_1')
+    expect(bodies[1]).toEqual({})
+
+    // An all-null policy collapses to no `policy` key at all.
+    await client.startAutorun('prj_1', undefined, undefined, {
+      score_threshold: null,
+      max_revisions: undefined,
+      target_words: null,
+      on_chapter_failure: undefined,
+    } as never)
+    expect(bodies[2]).toEqual({})
+  })
+
+  it('reads the zero-prose management snapshot from the pipeline route', async () => {
+    const fetchMock = mockFetch(async input => {
+      expect(String(input)).toBe(`http://127.0.0.1:17861${routes.pipeline('prj_1')}`)
+      return jsonResponse({ state: 'running', totals: { committed: 3 } }, 200, { 'x-protocol-version': '1.0' })
+    })
+    const client = new NovelClient({
+      endpoint: 'http://127.0.0.1:17861',
+      timeoutMs: 1_000,
+      fetch: fetchMock,
+    })
+    const result = await client.pipelineStatus('prj_1')
+    expect(result.ok).toBe(true)
+    expect(result.result).toEqual({ state: 'running', totals: { committed: 3 } })
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
   it('wraps a successful direct JSON response in the stable envelope', async () => {
     const client = new NovelClient({
       endpoint: 'http://localhost:17861',

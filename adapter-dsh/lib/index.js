@@ -2,6 +2,7 @@ import Schema from '@deepseek-ai/schemastery';
 import { NovelClient } from './client.js';
 import { NovelAdapterError } from './errors.js';
 import { performHandshake } from './handshake.js';
+import { createLazySidecar } from './lazy.js';
 import { registerNovelTools } from './tools.js';
 export const name = 'dsh-novel-plugin';
 export const inject = ['tools'];
@@ -12,7 +13,12 @@ export const Config = Schema.object({
     requestTimeoutMs: Schema.number().min(1).default(30_000),
     handshakeTimeoutMs: Schema.number().min(1).default(5_000),
     maxRenderChars: Schema.number().min(1_000).default(20_000),
-    requireHandshake: Schema.boolean().default(true),
+    /** @deprecated Only `false` still means something (`handshakeMode: 'off'`). */
+    requireHandshake: Schema.boolean(),
+    // No schema default on purpose: resolveConfig owns the effective default so
+    // the legacy `requireHandshake: false` mapping keeps working when this field
+    // is absent.
+    handshakeMode: Schema.union(['lazy', 'boot', 'off']),
 });
 export async function apply(ctx, config = {}) {
     const resolved = resolveConfig(config);
@@ -23,10 +29,13 @@ export async function apply(ctx, config = {}) {
     });
     ctx.effect(() => () => client.close());
     try {
-        if (resolved.requireHandshake) {
+        if (resolved.handshakeMode === 'boot') {
             await performHandshake(client, { timeoutMs: resolved.handshakeTimeoutMs });
         }
-        registerNovelTools(ctx, client, resolved.requestTimeoutMs, resolved.maxRenderChars);
+        const sidecar = resolved.handshakeMode === 'lazy'
+            ? createLazySidecar(client, { endpoint: resolved.endpoint, timeoutMs: resolved.handshakeTimeoutMs })
+            : client;
+        registerNovelTools(ctx, sidecar, resolved.requestTimeoutMs, resolved.maxRenderChars);
     }
     catch (error) {
         client.close();
@@ -49,9 +58,15 @@ function resolveConfig(config) {
         requestTimeoutMs,
         handshakeTimeoutMs,
         maxRenderChars,
-        requireHandshake: config.requireHandshake ?? true,
+        handshakeMode: resolveHandshakeMode(config),
         ...(token === undefined || token.length === 0 ? {} : { token }),
     };
+}
+/** `handshakeMode` wins; the deprecated `requireHandshake: false` maps to `'off'`. */
+function resolveHandshakeMode(config) {
+    if (config.handshakeMode !== undefined)
+        return config.handshakeMode;
+    return config.requireHandshake === false ? 'off' : 'lazy';
 }
 function positiveInteger(name, value) {
     if (!Number.isSafeInteger(value) || value < 1) {
@@ -59,8 +74,9 @@ function positiveInteger(name, value) {
     }
     return value;
 }
-export { NovelClient, routes } from './client.js';
+export { NovelClient, compactPolicy, routes } from './client.js';
 export { NovelAdapterError } from './errors.js';
 export { performHandshake } from './handshake.js';
+export { createLazySidecar } from './lazy.js';
 export { REQUIRED_CAPABILITIES } from './protocol.js';
 //# sourceMappingURL=index.js.map

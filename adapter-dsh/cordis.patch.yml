@@ -7,4 +7,4 @@
         requestTimeoutMs: 30000
         handshakeTimeoutMs: 5000
         maxRenderChars: 20000
-        requireHandshake: true
+        handshakeMode: lazy

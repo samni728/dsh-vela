@@ -3,10 +3,25 @@ import Schema from '@deepseek-ai/schemastery'
 import { NovelClient } from './client.js'
 import { NovelAdapterError } from './errors.js'
 import { performHandshake } from './handshake.js'
+import { createLazySidecar } from './lazy.js'
 import { registerNovelTools } from './tools.js'
 
 export const name = 'dsh-novel-plugin'
 export const inject = ['tools']
+
+/**
+ * When the adapter performs the Sidecar capability handshake:
+ *
+ * - `lazy` (default): mounting never touches the network, so a missing Sidecar
+ *   can never fail the Harness profile bootstrap. The first tool call performs
+ *   the handshake once (bounded by `handshakeTimeoutMs`) and remembers success;
+ *   a failure returns an `ADAPTER_SIDECAR_UNAVAILABLE` envelope for that call
+ *   only and is retried on the next call.
+ * - `boot`: strict legacy behaviour — shake hands while mounting and throw on
+ *   failure.
+ * - `off`: never handshake.
+ */
+export type HandshakeMode = 'lazy' | 'boot' | 'off'
 
 export interface Config {
   endpoint?: string
@@ -15,7 +30,9 @@ export interface Config {
   requestTimeoutMs?: number
   handshakeTimeoutMs?: number
   maxRenderChars?: number
+  /** @deprecated Use `handshakeMode` instead. Only an explicit `false` is honored (mapped to `'off'`) and only while `handshakeMode` is unset. */
   requireHandshake?: boolean
+  handshakeMode?: HandshakeMode
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -25,7 +42,12 @@ export const Config: Schema<Config> = Schema.object({
   requestTimeoutMs: Schema.number().min(1).default(30_000),
   handshakeTimeoutMs: Schema.number().min(1).default(5_000),
   maxRenderChars: Schema.number().min(1_000).default(20_000),
-  requireHandshake: Schema.boolean().default(true),
+  /** @deprecated Only `false` still means something (`handshakeMode: 'off'`). */
+  requireHandshake: Schema.boolean(),
+  // No schema default on purpose: resolveConfig owns the effective default so
+  // the legacy `requireHandshake: false` mapping keeps working when this field
+  // is absent.
+  handshakeMode: Schema.union<HandshakeMode>(['lazy', 'boot', 'off']),
 })
 
 export async function apply(ctx: Context, config: Config = {}): Promise<void> {
@@ -37,10 +59,13 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   })
   ctx.effect(() => () => client.close())
   try {
-    if (resolved.requireHandshake) {
+    if (resolved.handshakeMode === 'boot') {
       await performHandshake(client, { timeoutMs: resolved.handshakeTimeoutMs })
     }
-    registerNovelTools(ctx, client, resolved.requestTimeoutMs, resolved.maxRenderChars)
+    const sidecar = resolved.handshakeMode === 'lazy'
+      ? createLazySidecar(client, { endpoint: resolved.endpoint, timeoutMs: resolved.handshakeTimeoutMs })
+      : client
+    registerNovelTools(ctx, sidecar, resolved.requestTimeoutMs, resolved.maxRenderChars)
   } catch (error) {
     client.close()
     throw error
@@ -53,7 +78,7 @@ interface ResolvedConfig {
   requestTimeoutMs: number
   handshakeTimeoutMs: number
   maxRenderChars: number
-  requireHandshake: boolean
+  handshakeMode: HandshakeMode
 }
 
 function resolveConfig(config: Config): ResolvedConfig {
@@ -71,9 +96,15 @@ function resolveConfig(config: Config): ResolvedConfig {
     requestTimeoutMs,
     handshakeTimeoutMs,
     maxRenderChars,
-    requireHandshake: config.requireHandshake ?? true,
+    handshakeMode: resolveHandshakeMode(config),
     ...(token === undefined || token.length === 0 ? {} : { token }),
   }
+}
+
+/** `handshakeMode` wins; the deprecated `requireHandshake: false` maps to `'off'`. */
+function resolveHandshakeMode(config: Config): HandshakeMode {
+  if (config.handshakeMode !== undefined) return config.handshakeMode
+  return config.requireHandshake === false ? 'off' : 'lazy'
 }
 
 function positiveInteger(name: string, value: number): number {
@@ -83,7 +114,9 @@ function positiveInteger(name: string, value: number): number {
   return value
 }
 
-export { NovelClient, routes } from './client.js'
+export { NovelClient, compactPolicy, routes } from './client.js'
+export type { NovelPolicyInput, NovelSidecar } from './client.js'
 export { NovelAdapterError } from './errors.js'
 export { performHandshake } from './handshake.js'
+export { createLazySidecar } from './lazy.js'
 export { REQUIRED_CAPABILITIES } from './protocol.js'
