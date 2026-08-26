@@ -13,7 +13,7 @@ from dsh_novel.domain import ChapterContract, ChapterDelta, ContextPackage, Qual
 from dsh_novel.errors import ProjectNotFoundError, RunNotFoundError
 from dsh_novel.util import canonical_json, new_id, sha256_text, utc_now
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 PROJECT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{3,64}$")
 
 MIGRATIONS: dict[int, str] = {
@@ -108,9 +108,40 @@ CREATE TABLE IF NOT EXISTS runs (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_runs_chapter ON runs(chapter_number, created_at);
-"""
+""",
+    # 0.4.0: per-run LLM review history (list of ReviewVerdict records as JSON).
+    # Backward compatible: old databases gain a nullable column via ALTER TABLE.
+    2: """
+ALTER TABLE runs ADD COLUMN review_json TEXT;
+""",
+    # 0.5.0: per-project writing policy (score_threshold / max_revisions /
+    # target_words / on_chapter_failure) persisted as a JSON object.
+    3: """
+ALTER TABLE projects ADD COLUMN policy_json TEXT;
+""",
 }
 
+
+def _parse_review_history(raw: str | None) -> list[dict[str, Any]]:
+    """Decode a runs.review_json payload; tolerate legacy/garbage values."""
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return []
+    return value if isinstance(value, list) else []
+
+
+def _parse_policy_json(raw: str | None) -> dict[str, Any]:
+    """Decode a projects.policy_json payload; tolerate legacy/garbage values."""
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 class ProjectDatabase:
     def __init__(self, projects_root: Path, project_id: str) -> None:
@@ -206,6 +237,7 @@ class ProjectDatabase:
             result = dict(row)
             result["hard_rules"] = json.loads(result.pop("hard_rules_json"))
             result["story_spine"] = json.loads(result.pop("story_spine_json"))
+            result["policy"] = _parse_policy_json(result.pop("policy_json", None))
             counts = connection.execute(
                 """
                 SELECT
@@ -228,13 +260,14 @@ class ProjectDatabase:
                     "updated_at FROM chapters ORDER BY chapter_number"
                 )
             ]
-            result["recent_runs"] = [
-                dict(row)
-                for row in connection.execute(
-                    "SELECT id, chapter_number, status, stage, attempt, error_code, updated_at "
-                    "FROM runs ORDER BY created_at DESC LIMIT 10"
-                )
-            ]
+            result["recent_runs"] = []
+            for row in connection.execute(
+                "SELECT id, chapter_number, status, stage, attempt, error_code, "
+                "review_json, updated_at FROM runs ORDER BY created_at DESC LIMIT 10"
+            ):
+                item = dict(row)
+                item["review"] = _parse_review_history(item.pop("review_json"))
+                result["recent_runs"].append(item)
         return result
 
     def save_contract(self, contract: ChapterContract) -> None:
@@ -356,7 +389,21 @@ class ProjectDatabase:
             raise RunNotFoundError(f"run {run_id!r} was not found")
         result = dict(row)
         result["contract"] = json.loads(result.pop("contract_json"))
+        result["review"] = _parse_review_history(result.pop("review_json", None))
         return result
+
+    def append_review_verdict(self, run_id: str, record: dict[str, Any]) -> None:
+        """Append one ReviewVerdict record to the run's review history."""
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT review_json FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            history = _parse_review_history(row["review_json"]) if row else []
+            history.append(record)
+            connection.execute(
+                "UPDATE runs SET review_json = ?, updated_at = ? WHERE id = ?",
+                (canonical_json(history), utc_now(), run_id),
+            )
 
     def update_run(
         self,
@@ -528,6 +575,174 @@ class ProjectDatabase:
                 (chapter_number,),
             ).fetchone()
         return str(row["content"]) if row else None
+
+    def save_story_spine(self, story_spine: dict[str, Any]) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE projects SET story_spine_json = ?, updated_at = ?",
+                (canonical_json(story_spine), utc_now()),
+            )
+
+    def project_policy(self) -> dict[str, Any]:
+        """Stored raw policy dict; empty when the project never set one."""
+        self.ensure_exists()
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT policy_json FROM projects LIMIT 1"
+            ).fetchone()
+        return _parse_policy_json(row["policy_json"] if row else None)
+
+    def save_policy(self, policy: dict[str, Any]) -> None:
+        """Persist the effective policy object (first set or later override)."""
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE projects SET policy_json = ?, updated_at = ?",
+                (canonical_json(policy), utc_now()),
+            )
+
+    def committed_chapter_numbers(self) -> list[int]:
+        self.ensure_exists()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT chapter_number FROM chapters WHERE status = 'COMMITTED' "
+                "ORDER BY chapter_number"
+            ).fetchall()
+        return [int(row["chapter_number"]) for row in rows]
+
+    def chapter_overview(self) -> list[dict[str, Any]]:
+        """chapter_number/status/title rows only — no digest, no prose."""
+        self.ensure_exists()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT chapter_number, status, title FROM chapters "
+                "ORDER BY chapter_number"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def attempted_chapter_numbers(self) -> list[int]:
+        """Chapters with at least one run (committed or not)."""
+        self.ensure_exists()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT chapter_number FROM runs ORDER BY chapter_number"
+            ).fetchall()
+        return [int(row["chapter_number"]) for row in rows]
+
+    def chapter_attempts(self) -> dict[int, int]:
+        """Highest run attempt per chapter (0 when never attempted)."""
+        self.ensure_exists()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT chapter_number, MAX(attempt) AS max_attempt FROM runs "
+                "GROUP BY chapter_number"
+            ).fetchall()
+        return {int(row["chapter_number"]): int(row["max_attempt"] or 0) for row in rows}
+
+    def chapter_word_counts(self) -> dict[int, int]:
+        """Character count of the finalized content per committed chapter."""
+        self.ensure_exists()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.chapter_number AS chapter_number, LENGTH(r.content) AS chars
+                FROM chapters c
+                JOIN revisions r ON r.id = c.finalized_revision_id
+                WHERE c.status = 'COMMITTED'
+                """
+            ).fetchall()
+        return {
+            int(row["chapter_number"]): int(row["chars"] or 0)
+            for row in rows
+        }
+
+    def latest_run_by_chapter(self) -> dict[int, dict[str, Any]]:
+        """Most recent run summary per chapter (for rework-queue reasons)."""
+        self.ensure_exists()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT chapter_number, status, attempt, error_code, error_message "
+                "FROM runs ORDER BY rowid ASC"
+            ).fetchall()
+        latest: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            latest[int(row["chapter_number"])] = dict(row)
+        return latest
+
+    def blocking_issues_for_run(self, run_id: str) -> list[dict[str, str]]:
+        """Blocking issues ({type, description, severity}) recorded for one run.
+
+        Feeds the revision feedback loop: only blocker/error severity issues are
+        returned, in insertion order, with descriptions bounded for prompting.
+        """
+        self.ensure_exists()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT issue_json FROM review_issues WHERE run_id = ? ORDER BY rowid",
+                (run_id,),
+            ).fetchall()
+        result: list[dict[str, str]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["issue_json"])
+            except ValueError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            severity = str(payload.get("severity", "warning"))
+            if severity not in {"blocker", "error"}:
+                continue
+            result.append(
+                {
+                    "type": str(payload.get("issue_type", "unknown")),
+                    "description": str(payload.get("instruction", ""))[:800],
+                    "severity": severity,
+                }
+            )
+        return result
+
+    def latest_review_by_chapter(self) -> dict[int, dict[str, Any]]:
+        """Most recent review record per chapter across all runs."""
+        self.ensure_exists()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT chapter_number, review_json FROM runs "
+                "WHERE review_json IS NOT NULL AND review_json != '' "
+                "ORDER BY created_at ASC"
+            ).fetchall()
+        latest: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            history = _parse_review_history(row["review_json"])
+            if history:
+                latest[int(row["chapter_number"])] = history[-1]
+        return latest
+
+    def quality_event_summary(self) -> list[dict[str, Any]]:
+        """Per-chapter quality issue counts grouped by severity and type."""
+        self.ensure_exists()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT chapter_number, issue_json
+                FROM review_issues ORDER BY chapter_number
+                """
+            ).fetchall()
+        summary: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            chapter = int(row["chapter_number"])
+            entry = summary.setdefault(
+                chapter,
+                {"chapter_number": chapter, "blocker": 0, "error": 0, "warning": 0, "types": {}},
+            )
+            try:
+                payload = json.loads(row["issue_json"])
+                severity = str(payload.get("severity", "warning"))
+                issue_type = str(payload.get("issue_type", "unknown"))
+            except ValueError:
+                severity, issue_type = "warning", "unknown"
+            if severity in entry:
+                entry[severity] += 1
+            entry["types"][issue_type] = entry["types"].get(issue_type, 0) + 1
+        return [summary[key] for key in sorted(summary)]
 
     def export(self, export_format: str) -> str:
         self.ensure_exists()

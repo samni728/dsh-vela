@@ -3,7 +3,12 @@ from dsh_novel.domain.models import (
     ChapterDelta,
     ContextBlock,
     ContextPackage,
+    OutlineChapter,
+    OutlineResult,
     QualityIssue,
+    ReviewIssue,
+    ReviewScores,
+    ReviewVerdict,
 )
 
 __all__ = [
@@ -11,6 +16,11 @@ __all__ = [
     "ChapterDelta",
     "ContextBlock",
     "ContextPackage",
+    "OutlineChapter",
+    "OutlineResult",
     "QualityIssue",
+    "ReviewIssue",
+    "ReviewScores",
+    "ReviewVerdict",
 ]
 

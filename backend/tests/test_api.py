@@ -48,6 +48,9 @@ def test_health_and_capability_handshake(client: TestClient) -> None:
     assert capabilities.json()["optional_capabilities"] == {
         "embedding": False,
         "rerank": False,
+        "llm_review": True,
+        "outline": True,
+        "autorun": True,
     }
 
 

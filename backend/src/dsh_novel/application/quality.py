@@ -11,6 +11,38 @@ POLLUTION_PATTERNS = (
     re.compile(r"^```(?:json|yaml)", re.IGNORECASE | re.MULTILINE),
 )
 
+# dense_short_line_repeat: a "short line" is a paragraph whose normalized text is
+# 6..23 chars. When the same normalized short line recurs three times with the
+# 1st and 3rd occurrence at most DENSE_SHORT_LINE_WINDOW_SLOTS apart AND the
+# surrounding exchange repeats too (at least two of the three occurrences share
+# the same normalized neighbour paragraph), the chapter is retelling the same
+# scene (incident: ch8 rewrote its kiss scene three times, 237 slots apart).
+# Cross-scene verbal tics — the same reply ("知道。") in unrelated scenes —
+# have different neighbours and never trigger, whatever the distance.
+SHORT_LINE_MIN_CHARS = 6
+SHORT_LINE_MAX_CHARS = 23
+DENSE_SHORT_LINE_WINDOW_SLOTS = 400
+
+# cross_chapter_exact_repeat: paragraphs of at least this many normalized chars
+# that appear verbatim in any recent chapter (incident: ch5 lamp description
+# copied word-for-word into ch6).
+CROSS_CHAPTER_MIN_CHARS = 40
+
+# truncated_ending: the final non-empty paragraph must end with sentence-final
+# punctuation (incident: ch10 stopped mid-sentence). Full-width closing quotes
+# are included because Chinese dialogue routinely ends 说："……"。 with the
+# period inside the quotes.
+SENTENCE_ENDING_PUNCTUATION = ("。", "！", "？", "…", '"', "'", "」", "』", "!", "?", ".", "”", "’")
+
+# required_event_keyword_missing: keywords are tokenized from each contract
+# event description — >=2-char alnum tokens plus, for Chinese (which has no
+# spaces), character bigrams of every CJK run as dependency-free "word tokens".
+# When NONE of an event's keywords appears in the chapter the event was likely
+# skipped; reported as a warning for the LLM reviewer and humans, never a
+# blocker. Any single keyword hit counts as possible rewritten coverage.
+KEYWORD_ALNUM_RE = re.compile(r"[A-Za-z0-9]{2,}")
+KEYWORD_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+
 
 def _paragraphs(content: str) -> list[tuple[int, int, str]]:
     results: list[tuple[int, int, str]] = []
@@ -34,6 +66,213 @@ def _similarity(left: str, right: str) -> float:
     if not left_set or not right_set:
         return 0.0
     return len(left_set & right_set) / len(left_set | right_set)
+
+
+def inspect_dense_short_line_repeat(
+    *, chapter_number: int, content: str
+) -> list[QualityIssue]:
+    """Blocker: the same short line recurs densely inside a sliding window.
+
+    Short lines (normalized length 6..23) are grouped by normalized text. For
+    each group with at least three occurrences, every consecutive triple is
+    checked: if the 1st and 3rd occurrence of a triple are at most
+    ``DENSE_SHORT_LINE_WINDOW_SLOTS`` short-line slots apart AND at least two
+    of the three occurrences share the same normalized neighbour paragraph,
+    the chapter is retelling the same scene — a true retell repeats the
+    surrounding exchange as well. Cross-scene verbal tics keep their own
+    neighbours and stay untouched.
+    """
+    all_slots = [
+        (start, end, paragraph, normalized_text(paragraph))
+        for start, end, paragraph in _paragraphs(content)
+    ]
+    norms = [normalized for _, _, _, normalized in all_slots]
+    short_positions = [
+        index
+        for index, (_, _, _, normalized) in enumerate(all_slots)
+        if SHORT_LINE_MIN_CHARS <= len(normalized) <= SHORT_LINE_MAX_CHARS
+    ]
+
+    def _context(slot_index: int) -> tuple[str, str]:
+        previous = norms[slot_index - 1] if slot_index > 0 else ""
+        following = (
+            norms[slot_index + 1] if slot_index + 1 < len(norms) else ""
+        )
+        return (previous, following)
+
+    groups: dict[str, list[int]] = {}
+    for slot_index in short_positions:
+        groups.setdefault(norms[slot_index], []).append(slot_index)
+
+    issues: list[QualityIssue] = []
+    for normalized, positions in groups.items():
+        if len(positions) < 3:
+            continue
+        for first, second, third in zip(
+            positions, positions[1:], positions[2:], strict=False
+        ):
+            if third - first > DENSE_SHORT_LINE_WINDOW_SLOTS:
+                continue
+            contexts = (_context(first), _context(second), _context(third))
+            previous_neighbours = {context[0] for context in contexts}
+            following_neighbours = {context[1] for context in contexts}
+            if (
+                len(previous_neighbours) == len(contexts)
+                and len(following_neighbours) == len(contexts)
+            ):
+                continue
+            sample_start, sample_end, sample_text, _ = all_slots[third]
+            issues.append(
+                QualityIssue(
+                    issue_id=new_id("issue"),
+                    issue_type="dense_short_line_repeat",
+                    severity="blocker",
+                    chapter_number=chapter_number,
+                    span_start=sample_start,
+                    span_end=sample_end,
+                    source_hash=sha256_text(normalized),
+                    instruction=(
+                        "同一短行在小窗口内循环出现了三次以上，"
+                        "删除或改写重复的对话循环，不要重写整章。"
+                    ),
+                    evidence=[
+                        f"text:{sample_text}",
+                        f"occurrence_slots:{first},{second},{third}",
+                        f"window_slots:{third - first}",
+                    ],
+                )
+            )
+            break
+    return issues
+
+
+def inspect_cross_chapter_exact_repeat(
+    *,
+    chapter_number: int,
+    content: str,
+    recent_chapters: list[dict[str, object]],
+) -> list[QualityIssue]:
+    """Blocker: a >=40-char normalized paragraph copied verbatim from a recent chapter."""
+    historical: dict[str, int] = {}
+    for chapter in recent_chapters:
+        source_chapter = int(chapter["chapter_number"])
+        for _, _, paragraph in _paragraphs(str(chapter["content"])):
+            normalized = normalized_text(paragraph)
+            if len(normalized) >= CROSS_CHAPTER_MIN_CHARS:
+                historical.setdefault(normalized, source_chapter)
+
+    issues: list[QualityIssue] = []
+    reported: set[str] = set()
+    for start, end, paragraph in _paragraphs(content):
+        normalized = normalized_text(paragraph)
+        if len(normalized) < CROSS_CHAPTER_MIN_CHARS or normalized in reported:
+            continue
+        source_chapter = historical.get(normalized)
+        if source_chapter is None:
+            continue
+        reported.add(normalized)
+        issues.append(
+            QualityIssue(
+                issue_id=new_id("issue"),
+                issue_type="cross_chapter_exact_repeat",
+                severity="blocker",
+                chapter_number=chapter_number,
+                span_start=start,
+                span_end=end,
+                source_hash=sha256_text(paragraph),
+                instruction="整段与前文章节完全相同，删除或局部改写该段，不要复述已定稿内容。",
+                evidence=[
+                    f"source_chapter:{source_chapter}",
+                    f"text:{paragraph[:120]}",
+                ],
+            )
+        )
+    return issues
+
+
+def inspect_truncated_ending(*, chapter_number: int, content: str) -> QualityIssue | None:
+    """Blocker: the final non-empty paragraph lacks sentence-final punctuation.
+
+    Empty content is already reported as ``empty_content`` and is not re-flagged.
+    """
+    last_paragraph = ""
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped:
+            last_paragraph = stripped
+    if not last_paragraph or last_paragraph.endswith(SENTENCE_ENDING_PUNCTUATION):
+        return None
+    span_start = max(content.rfind(last_paragraph), 0)
+    return QualityIssue(
+        issue_id=new_id("issue"),
+        issue_type="truncated_ending",
+        severity="blocker",
+        chapter_number=chapter_number,
+        span_start=span_start,
+        span_end=span_start + len(last_paragraph),
+        source_hash=sha256_text(last_paragraph),
+        instruction="结尾在半句处截断，请把最后一段补全到以句末标点收束。",
+        evidence=[f"tail:{last_paragraph[-40:]}"],
+    )
+
+
+def event_keywords(event: str) -> list[str]:
+    """Tokenize an event description into deduplicated >=2-char word tokens."""
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    def add(token: str) -> None:
+        if token and token not in seen:
+            seen.add(token)
+            tokens.append(token)
+
+    for token in KEYWORD_ALNUM_RE.findall(event):
+        add(token)
+    for run in KEYWORD_CJK_RUN_RE.findall(event):
+        if len(run) < 2:
+            continue  # a lone hanzi has no reliable >=2-char token
+        for index in range(len(run) - 1):
+            add(run[index : index + 2])
+    return tokens
+
+
+def inspect_required_event_keywords(
+    *,
+    chapter_number: int,
+    content: str,
+    contract: ChapterContract,
+) -> list[QualityIssue]:
+    """Warning: every keyword of a required event is absent from the chapter.
+
+    Deliberately looser than ``required_event_missing`` (which demands the full
+    normalized event as a substring): if ANY token of the event shows up, the
+    event is considered possibly covered in rewritten form and stays silent.
+    """
+    issues: list[QualityIssue] = []
+    for event in contract.required_events:
+        keywords = event_keywords(event)
+        if not keywords:
+            continue
+        if any(keyword in content for keyword in keywords):
+            continue
+        issues.append(
+            QualityIssue(
+                issue_id=new_id("issue"),
+                issue_type="required_event_keyword_missing",
+                severity="warning",
+                chapter_number=chapter_number,
+                span_start=0,
+                span_end=0,
+                source_hash=sha256_text(content),
+                instruction=(
+                    f"合同事件「{event}」的关键词均未在正文出现，"
+                    "请核对是否以改写方式覆盖"
+                    f"（关键词示例：{'、'.join(keywords[:8])}）。"
+                ),
+                evidence=[f"event:{event}", f"keywords:{','.join(keywords)}"],
+            )
+        )
+    return issues
 
 
 def inspect_chapter(
@@ -145,4 +384,23 @@ def inspect_chapter(
                     evidence=[event],
                 )
             )
+
+    issues.extend(inspect_dense_short_line_repeat(chapter_number=chapter_number, content=content))
+    issues.extend(
+        inspect_required_event_keywords(
+            chapter_number=chapter_number,
+            content=content,
+            contract=contract,
+        )
+    )
+    issues.extend(
+        inspect_cross_chapter_exact_repeat(
+            chapter_number=chapter_number,
+            content=content,
+            recent_chapters=recent_chapters,
+        )
+    )
+    truncated = inspect_truncated_ending(chapter_number=chapter_number, content=content)
+    if truncated is not None:
+        issues.append(truncated)
     return issues

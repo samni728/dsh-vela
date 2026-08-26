@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-from dsh_novel.providers.base import WriterRequest
+import os
+
+from dsh_novel.domain import OutlineChapter, OutlineResult, ReviewScores, ReviewVerdict
+from dsh_novel.providers.base import OutlineRequest, ReviewRequest, WriterRequest
+
+# Test hook: comma-separated overall review scores, one per attempt. The i-th
+# draft attempt (1-based) receives the i-th value; the last value repeats.
+# Example: FAKE_REVIEW_SCORES="6.5,9" -> attempt 1 scores 6.5, attempt 2 scores 9.
+FAKE_REVIEW_SCORES_ENV = "FAKE_REVIEW_SCORES"
+
+_OUTLINE_ACTS = ("开局", "推进", "升级", "转折", "收束")
 
 
 class DeterministicFakeProvider:
@@ -47,7 +57,7 @@ class DeterministicFakeProvider:
             ),
         ]
         opening, turn = variants[(contract.chapter_number - 1) % len(variants)]
-        return "\n\n".join(
+        body = "\n\n".join(
             [
                 f"# {contract.title}",
                 f"{opening}第{contract.chapter_number}章围绕{contract.purpose}展开。",
@@ -60,3 +70,75 @@ class DeterministicFakeProvider:
                 or f"章节结束时，人物已经完成第{contract.chapter_number}章的选择，并准备继续前行。",
             ]
         )
+        if request.revision_feedback:
+            # Visible marker at the very end of the body so tests (and humans)
+            # can assert the feedback loop reached the writer. It ends with a
+            # sentence period on purpose: the truncated_ending quality gate
+            # requires the final paragraph to close with sentence punctuation.
+            types = ",".join(
+                str(item.get("type", "unknown")) for item in request.revision_feedback
+            )
+            body = f"{body}\n\n[feedback:{types}]。"
+        return body
+
+    def review_chapter(self, request: ReviewRequest) -> ReviewVerdict:
+        """Fixed pass verdict so offline smoke runs never block on review.
+
+        With ``FAKE_REVIEW_SCORES`` set, the score follows the draft attempt so
+        threshold-loop tests can script a failing first draft that passes on
+        rewrite.
+        """
+        score = 8.0
+        raw = os.getenv(FAKE_REVIEW_SCORES_ENV)
+        if raw:
+            try:
+                values = [float(item.strip()) for item in raw.split(",") if item.strip()]
+            except ValueError:
+                values = []
+            if values:
+                index = min(max(request.attempt - 1, 0), len(values) - 1)
+                score = values[index]
+        return ReviewVerdict(
+            verdict="pass",
+            issues=[],
+            scores=ReviewScores(
+                contract_adherence=score, era_authenticity=score, flow=score
+            ),
+        )
+
+    def generate_outline(self, request: OutlineRequest) -> OutlineResult:
+        """Deterministic canned outline covering exactly 1..target_chapters."""
+        chapters = []
+        for number in range(1, request.target_chapters + 1):
+            act = _OUTLINE_ACTS[(number - 1) % len(_OUTLINE_ACTS)]
+            plants = (
+                [f"第{number}章埋下{act}阶段的悬念：未寄出的信"] if number % 2 == 1 else []
+            )
+            advances = (
+                [] if number % 2 == 1 else [f"推进第{number - 1}章埋下的悬念"]
+            )
+            chapters.append(
+                OutlineChapter(
+                    chapter_number=number,
+                    title=f"第{number}章·{act}",
+                    purpose=(
+                        f"第{number}章以「{act}」的姿态推进《{request.title}》的核心冲突，"
+                        "并为下一章留下清晰的衔接。"
+                    ),
+                    required_events=[
+                        f"第{number}章关键事件：主角在{act}阶段做出不可逆的选择"
+                    ],
+                    hooks_to_plant=plants,
+                    hooks_to_advance=advances,
+                    target_words=request.target_words,
+                )
+            )
+        story_spine = {
+            "central_conflict": (
+                f"《{request.title}》：{request.premise[:60] or '核心冲突的展开与回收'}"
+            ),
+            "acts": list(_OUTLINE_ACTS),
+            "hard_rules": list(request.hard_rules),
+            "ending_constraint": "全部伏笔在末章前收束，结局呼应第一章的初始条件。",
+        }
+        return OutlineResult(story_spine=story_spine, chapters=chapters)

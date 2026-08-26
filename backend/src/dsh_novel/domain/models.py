@@ -79,4 +79,44 @@ class QualityIssue(StrictModel):
     instruction: str
     evidence: list[str] = Field(default_factory=list)
     confidence: float = Field(default=1.0, ge=0, le=1)
+    # Where the issue came from: deterministic rules or the optional LLM
+    # reviewer. Defaults to "rule" so pre-existing serialized issues stay valid.
+    source: Literal["rule", "llm"] = "rule"
+
+
+class ReviewIssue(StrictModel):
+    severity: Literal["blocker", "warning"]
+    type: str = Field(min_length=1)
+    description: str
+
+
+class ReviewScores(StrictModel):
+    contract_adherence: float = Field(ge=0, le=10)
+    era_authenticity: float = Field(ge=0, le=10)
+    flow: float = Field(ge=0, le=10)
+
+
+class ReviewVerdict(StrictModel):
+    verdict: Literal["pass", "blocked"]
+    issues: list[ReviewIssue] = Field(default_factory=list)
+    scores: ReviewScores | None = None
+
+
+class OutlineChapter(StrictModel):
+    """One chapter entry of a generated outline."""
+
+    chapter_number: int = Field(ge=1)
+    title: str = Field(min_length=1, max_length=200)
+    purpose: str = Field(min_length=1)
+    required_events: list[str] = Field(default_factory=list)
+    hooks_to_plant: list[str] = Field(default_factory=list)
+    hooks_to_advance: list[str] = Field(default_factory=list)
+    target_words: int = Field(default=3500, ge=100, le=20000)
+
+
+class OutlineResult(StrictModel):
+    """Structured whole-book outline produced by the outline agent."""
+
+    story_spine: dict[str, Any]
+    chapters: list[OutlineChapter] = Field(default_factory=list)
 

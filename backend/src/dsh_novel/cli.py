@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -9,8 +10,8 @@ import uvicorn
 
 from dsh_novel.api_models import ProjectCreateRequest
 from dsh_novel.application import NovelService
-from dsh_novel.config import Settings
-from dsh_novel.transports.http import build_provider, create_app
+from dsh_novel.config import CONFIG_FILE_ENV, ConfigError, Settings, config_file_path
+from dsh_novel.transports.http import build_provider, build_reviewer, create_app
 
 
 def _print(value: Any) -> None:
@@ -19,10 +20,12 @@ def _print(value: Any) -> None:
 
 def _service(settings: Settings) -> NovelService:
     settings.ensure_directories()
+    provider = build_provider(settings)
     return NovelService(
         projects_root=settings.data_dir / "projects",
-        provider=build_provider(settings),
+        provider=provider,
         context_token_budget=settings.context_token_budget,
+        reviewer=build_reviewer(settings, provider),
     )
 
 
@@ -53,14 +56,31 @@ def parser() -> argparse.ArgumentParser:
     export = commands.add_parser("export")
     export.add_argument("project_id")
     export.add_argument("--format", choices=["markdown", "text"], default="markdown")
+
+    commands.add_parser(
+        "config-path",
+        help="print the effective config.yml path and whether it exists",
+    )
     return root
+
+
+def _print_config_path() -> None:
+    path = config_file_path()
+    source = CONFIG_FILE_ENV if os.getenv(CONFIG_FILE_ENV) else "default"
+    _print({"config_path": str(path), "exists": path.is_file(), "source": source})
 
 
 def main() -> None:
     args = parser().parse_args()
-    settings = Settings()
-    if args.data_dir:
-        settings = Settings(data_dir=args.data_dir)
+    if args.command == "config-path":
+        _print_config_path()
+        return
+    try:
+        settings = Settings()
+        if args.data_dir:
+            settings = Settings(data_dir=args.data_dir)
+    except ConfigError as exc:
+        raise SystemExit(f"dsh-novel: invalid configuration: {exc}") from exc
     if args.command == "serve":
         uvicorn.run(
             create_app(settings),
