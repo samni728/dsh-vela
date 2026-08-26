@@ -143,6 +143,11 @@ def _parse_policy_json(raw: str | None) -> dict[str, Any]:
         return {}
     return value if isinstance(value, dict) else {}
 
+# Paths whose schema migrations have already run in this process (idempotence
+# guard for the lazy migrate-on-connect of legacy project databases).
+_migrated_paths: set[str] = set()
+
+
 class ProjectDatabase:
     def __init__(self, projects_root: Path, project_id: str) -> None:
         if not PROJECT_ID_PATTERN.fullmatch(project_id):
@@ -193,6 +198,12 @@ class ProjectDatabase:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = FULL")
+        # Legacy project databases created before newer schema versions are
+        # migrated lazily on first access (idempotent per path; the re-entrant
+        # connect() from migrate() skips the guard, so no recursion).
+        if self.path not in _migrated_paths:
+            _migrated_paths.add(self.path)
+            self.migrate()
         return connection
 
     @contextmanager

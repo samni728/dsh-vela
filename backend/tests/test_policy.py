@@ -118,6 +118,51 @@ def test_policy_migration_upgrades_legacy_database(tmp_path: Path) -> None:
     assert "policy_json" in columns
     assert row == ("旧项目",)
 
+
+def test_legacy_database_migrates_lazily_on_first_connect(tmp_path: Path) -> None:
+    """Regression: production never calls migrate() explicitly for legacy
+    project databases, so first access must upgrade them in place. Without
+    this, GET /pipeline 500s with 'no such column: review_json'."""
+    from dsh_novel.infrastructure.database import MIGRATIONS, ProjectDatabase
+
+    projects_root = tmp_path / "projects"
+    legacy_dir = projects_root / "legacy_connect"
+    legacy_dir.mkdir(parents=True)
+    connection = sqlite3.connect(legacy_dir / "novel.sqlite3")
+    try:
+        connection.executescript(MIGRATIONS[1])
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'legacy')"
+        )
+        connection.execute(
+            """
+            INSERT INTO projects(
+                id, title, premise, target_chapters, hard_rules_json,
+                story_spine_json, created_at, updated_at
+            ) VALUES ('legacy_connect', '旧项目', '', 2, '[]', '{}', 'legacy', 'legacy')
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    # No explicit migrate(): the regression is that connect() itself upgrades.
+    db = ProjectDatabase(projects_root, "legacy_connect")
+    db.project()  # opens a connection through connect()
+
+    raw = sqlite3.connect(legacy_dir / "novel.sqlite3")
+    try:
+        project_columns = {
+            row[1] for row in raw.execute("PRAGMA table_info(projects)").fetchall()
+        }
+        run_columns = {
+            row[1] for row in raw.execute("PRAGMA table_info(runs)").fetchall()
+        }
+    finally:
+        raw.close()
+    assert "policy_json" in project_columns
+    assert "review_json" in run_columns
+
     # Stored policy round-trips through the new column.
     assert db.project_policy() == {}
     db.save_policy({"score_threshold": 9.5, "on_chapter_failure": "pause"})
