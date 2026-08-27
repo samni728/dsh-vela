@@ -659,8 +659,9 @@ class ProjectDatabase:
 
     def uncommit_chapter(self, chapter_number: int) -> None:
         """Roll a COMMITTED chapter back to PREPARED so a later autorun will
-        re-draft it. History (revisions/deltas/canon_commits) is preserved —
-        only the chapter's committed state and its finalized pointer are reset.
+        re-draft it. Revisions/deltas history is preserved; the chapter's
+        canon_commit entry is removed because canon_commits has a UNIQUE
+        constraint on chapter_number and the re-commit would otherwise fail.
 
         Used by the master agent's force-rewrite path: reverify may flag a
         committed chapter as below threshold, and since the orchestrator never
@@ -686,6 +687,13 @@ class ProjectDatabase:
                 WHERE chapter_number = ?
                 """,
                 (now, chapter_number),
+            )
+            # Drop the old canon_commit row (UNIQUE on chapter_number) so the
+            # fresh commit can insert a new one. History lives on in revisions
+            # and chapter_deltas; this only frees the committed-slot.
+            connection.execute(
+                "DELETE FROM canon_commits WHERE chapter_number = ?",
+                (chapter_number,),
             )
 
     def chapter_overview(self) -> list[dict[str, Any]]:
