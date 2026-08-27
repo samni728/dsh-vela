@@ -52,6 +52,24 @@ class OutlineRequest:
     target_words: int = 3500
 
 
+@dataclass(frozen=True, slots=True)
+class ExtractionRequest:
+    """Input for the chapter-state extractor: turn one chapter's prose into the
+    structured core information the continuation mechanism needs.
+
+    This is the *real* delta: what changed for the characters, what happened
+    to each hook, and whether the chapter contains a twist — extracted from
+    the finalised prose, not echoed from the contract.
+    """
+
+    project_title: str
+    contract: ChapterContract
+    content: str
+    # Previous chapters' compressed core info (character_changes/hooks_status)
+    # so the extractor can state what *changed* relative to the last chapter.
+    previous_delta: dict[str, Any] | None = None
+
+
 class ModelProvider(Protocol):
     name: str
 
@@ -60,6 +78,8 @@ class ModelProvider(Protocol):
     def review_chapter(self, request: ReviewRequest) -> ReviewVerdict: ...
 
     def generate_outline(self, request: OutlineRequest) -> OutlineResult: ...
+
+    def extract_chapter_state(self, request: ExtractionRequest) -> dict[str, Any]: ...
 
 
 def default_generate_outline(request: OutlineRequest) -> OutlineResult:
@@ -126,6 +146,45 @@ def parse_review_payload(raw: str) -> ReviewVerdict:
         except ValidationError:
             continue
     raise ValueError("review response did not contain a valid verdict JSON object")
+
+
+def parse_extraction_payload(raw: str) -> dict[str, Any]:
+    """Parse a strict chapter-state extraction JSON payload.
+
+    The provider's extractor is fail-open, so a malformed response raises
+    ValueError here and the caller falls back to empty extraction (the service
+    then keeps contract-echo deltas rather than blocking the run).
+    """
+    cleaned = strip_think_blocks(raw)
+    cleaned = _strip_payload_fences(cleaned)
+    candidates = [cleaned]
+    match = _JSON_OBJECT_RE.search(cleaned)
+    if match:
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except ValueError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        # Lenient: unknown keys ignored; only pull the fields we persist.
+        result: dict[str, Any] = {
+            "character_changes": data.get("character_changes") or [],
+            "hooks_status": data.get("hooks_status") or [],
+            "twist": str(data.get("twist") or ""),
+            "next_chapter_hook": str(data.get("next_chapter_hook") or ""),
+        }
+        if not isinstance(result["character_changes"], list) or not isinstance(
+            result["hooks_status"], list
+        ):
+            continue
+        return result
+    raise ValueError(
+        "extraction response did not contain a valid extraction JSON object"
+    )
 
 
 def parse_outline_payload(raw: str, *, target_chapters: int) -> OutlineResult:

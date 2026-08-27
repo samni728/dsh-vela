@@ -27,7 +27,12 @@ from dsh_novel.errors import (
     VersionConflictError,
 )
 from dsh_novel.infrastructure import ProjectDatabase
-from dsh_novel.providers import ModelProvider, OutlineRequest, WriterRequest
+from dsh_novel.providers import (
+    ExtractionRequest,
+    ModelProvider,
+    OutlineRequest,
+    WriterRequest,
+)
 from dsh_novel.util import new_id, sha256_text, utc_now
 
 # Matches the ChapterContract default; used when no explicit target_words is
@@ -141,10 +146,12 @@ class NovelService:
             raise ConfigInvalidError("contract chapter_number does not match route")
         db.save_contract(contract)
         recent = db.recent_chapters(chapter_number, limit=3)
+        recent_deltas = db.recent_deltas(chapter_number, limit=3)
         package = self.compiler.compile(
             project=project,
             contract=contract,
             recent_chapters=recent,
+            recent_deltas=recent_deltas,
         )
         db.save_context(package)
         return contract, package
@@ -226,6 +233,9 @@ class NovelService:
             hooks_to_plant=list(chapter.hooks_to_plant),
             hooks_to_advance=list(chapter.hooks_to_advance),
             target_words=chapter.target_words,
+            characters=list(getattr(chapter, "characters", None) or []),
+            twist=str(getattr(chapter, "twist", None) or ""),
+            handoff=str(getattr(chapter, "handoff", None) or ""),
         )
 
     def run_chapter(
@@ -351,8 +361,12 @@ class NovelService:
         policy = self.effective_policy(db)
         max_revisions = int(policy["max_revisions"])
         recent = db.recent_chapters(contract.chapter_number, limit=3)
+        recent_deltas = db.recent_deltas(contract.chapter_number, limit=3)
         package = self.compiler.compile(
-            project=project, contract=contract, recent_chapters=recent
+            project=project,
+            contract=contract,
+            recent_chapters=recent,
+            recent_deltas=recent_deltas,
         )
         db.save_context(package)
         db.update_run(
@@ -468,6 +482,28 @@ class NovelService:
             )
 
         digest = content.replace("\n", " ").strip()[:500]
+        # 续写核心信息抽取：从定稿正文抽取人物核心变化 / 伏笔真实状态 /
+        # 反转 / 章末钩子（fail-open：抽取失败则回退到合同回声）。
+        extraction: dict[str, Any] = {}
+        extractor = getattr(self.provider, "extract_chapter_state", None)
+        if callable(extractor):
+            try:
+                prev_delta = None
+                prev_deltas = db.recent_deltas(contract.chapter_number, limit=1)
+                if prev_deltas:
+                    prev_delta = prev_deltas[-1]
+                extraction = extractor(
+                    ExtractionRequest(
+                        project_title=project["title"],
+                        contract=contract,
+                        content=content,
+                        previous_delta=prev_delta,
+                    )
+                ) or {}
+            except Exception:  # extraction must never block the pipeline
+                extraction = {}
+        character_changes = extraction.get("character_changes") or []
+        hooks_status = extraction.get("hooks_status") or []
         delta = ChapterDelta(
             project_id=project["id"],
             chapter_number=contract.chapter_number,
@@ -492,6 +528,10 @@ class NovelService:
             ],
             handoff=contract.handoff,
             digest=digest,
+            character_changes=character_changes,
+            hooks_status=hooks_status,
+            twist=str(extraction.get("twist") or ""),
+            next_chapter_hook=str(extraction.get("next_chapter_hook") or ""),
         )
         db.update_run(run_id, status="RUNNING", stage="COMMITTING")
         commit = db.finalize(

@@ -6,9 +6,11 @@ import httpx
 
 from dsh_novel.domain import OutlineResult, ReviewVerdict
 from dsh_novel.providers.base import (
+    ExtractionRequest,
     OutlineRequest,
     ReviewRequest,
     WriterRequest,
+    parse_extraction_payload,
     parse_outline_payload,
     parse_review_payload,
 )
@@ -18,6 +20,21 @@ from dsh_novel.util import canonical_json
 # the model can waste tokens re-stating the task, so give it generous room
 # (capped by the global model_max_output_tokens in the payload).
 _REVIEW_MAX_TOKENS = 8192
+
+EXTRACTION_SYSTEM_PROMPT = (
+    "你是中文小说章节状态抽取器。读取一章已定稿正文，抽取续写所需的结构化核心信息。"
+    "只报告正文里真实发生的内容，不得臆造。逐项输出："
+    "1) character_changes：本章人物关系或状态的实质变化，每项含 "
+    "{character（人物名）, before（章节开始时的状态）, after（章节结束时的状态）}；"
+    "2) hooks_status：本章每个伏笔的真实状态，每项含 "
+    "{hook（伏笔内容）, status（planted/advanced/resolved 之一）, evidence（正文依据，一句话）}；"
+    "3) twist：本章反转/转折点，无则空字符串；"
+    "4) next_chapter_hook：章末留下的人物状态或悬念（下一章续写锚点），无则空字符串。"
+    "直接输出一个 JSON 对象，禁止任何解释、分析或标签。JSON 格式："
+    '{"character_changes":[{"character":"...","before":"...","after":"..."}],'
+    '"hooks_status":[{"hook":"...","status":"planted","evidence":"..."}],'
+    '"twist":"...","next_chapter_hook":"..."}'
+)
 
 REVIEW_SYSTEM_PROMPT = (
     "你是严格的中文小说审稿编辑，在章节定稿前对照全书蓝图审查单章正文。逐项核对："
@@ -42,12 +59,16 @@ OUTLINE_SYSTEM_PROMPT = (
     "2) chapters 必须覆盖全部目标章节，chapter_number 从 1 开始连续编号到 N；"
     "3) 每章给出 title（章节标题）、purpose（本章叙事目的）、"
     "required_events（本章必须发生的事件）、hooks_to_plant（本章要埋设的伏笔）、"
-    "hooks_to_advance（本章要推进的已有伏笔）、target_words（本章目标字数，整数）。"
+    "hooks_to_advance（本章要推进的已有伏笔）、target_words（本章目标字数，整数）、"
+    "characters（本章涉及的人物及其关系/状态，如“赵峥（壮熊班长，外表钢铁直男）”、"
+    "“我（小熊新兵）”，含人物关系在章节中的变化）、"
+    "twist（本章反转/转折点，可为空字符串）、"
+    "handoff（章末衔接：本章结尾如何导向下一章，可为空字符串）。"
     "只输出一个 JSON 对象，禁止解释、分析、思考过程或任何标签。JSON 格式："
     '{"story_spine":{"central_conflict":"...","acts":["..."],"ending_constraint":"..."},'
     '"chapters":[{"chapter_number":1,"title":"...","purpose":"...",'
     '"required_events":["..."],"hooks_to_plant":["..."],"hooks_to_advance":["..."],'
-    '"target_words":4000}]}'
+    '"target_words":4000,"characters":["..."],"twist":"...","handoff":"..."}]}'
 )
 
 
@@ -184,6 +205,54 @@ class OpenAICompatibleProvider:
         }
         content = self._chat_completion(payload, self.review_timeout_seconds)
         return parse_review_payload(content)
+
+    def extract_chapter_state(self, request: ExtractionRequest) -> dict[str, Any]:
+        """Ask the model to extract structured core info from a finalised chapter.
+
+        Produces the *real* per-chapter state the continuation mechanism needs:
+        character relationship changes, hook status transitions and the twist.
+        Fail-open: on any error return an empty extraction (service falls back
+        to contract-echo deltas) so a long run is never blocked by this step.
+        """
+        sections = [
+            f"小说：{request.project_title}",
+            f"章节：第{request.contract.chapter_number}章《{request.contract.title}》",
+            f"章节目的：{request.contract.purpose}",
+            f"本章人物蓝图：{'、'.join(request.contract.characters) or '（未提供）'}",
+            f"本章反转计划：{request.contract.twist or '（无）'}",
+            f"本章伏笔（种植/推进）："
+            f"{'、'.join(request.contract.hooks_to_plant + request.contract.hooks_to_advance) or '（无）'}",
+        ]
+        if request.previous_delta:
+            prev_chars = request.previous_delta.get("character_changes") or []
+            prev_hooks = request.previous_delta.get("hooks_status") or []
+            if prev_chars or prev_hooks:
+                sections.append(
+                    "上一章结束时的核心状态（用于判断本章相对变化）：\n"
+                    + canonical_json({"character_changes": prev_chars, "hooks_status": prev_hooks})
+                )
+        sections.append(f"本章正文：\n{request.content}")
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                {"role": "user", "content": "\n\n".join(sections)},
+            ],
+            "temperature": 0.2,
+            "max_tokens": min(self.max_output_tokens, _REVIEW_MAX_TOKENS),
+        }
+        raw = self._chat_completion(payload, self.review_timeout_seconds)
+        try:
+            return parse_extraction_payload(raw)
+        except ValueError:
+            # Fail-open: the pipeline must never stall on extraction.
+            return {
+                "character_changes": [],
+                "hooks_status": [],
+                "twist": "",
+                "next_chapter_hook": "",
+            }
 
     def generate_outline(self, request: OutlineRequest) -> OutlineResult:
         """Generate the whole-book structured outline; retries parsing once."""

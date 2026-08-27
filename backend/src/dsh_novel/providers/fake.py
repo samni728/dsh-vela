@@ -3,7 +3,12 @@ from __future__ import annotations
 import os
 
 from dsh_novel.domain import OutlineChapter, OutlineResult, ReviewScores, ReviewVerdict
-from dsh_novel.providers.base import OutlineRequest, ReviewRequest, WriterRequest
+from dsh_novel.providers.base import (
+    ExtractionRequest,
+    OutlineRequest,
+    ReviewRequest,
+    WriterRequest,
+)
 
 # Test hook: comma-separated overall review scores, one per attempt. The i-th
 # draft attempt (1-based) receives the i-th value; the last value repeats.
@@ -131,6 +136,11 @@ class DeterministicFakeProvider:
                     hooks_to_plant=plants,
                     hooks_to_advance=advances,
                     target_words=request.target_words,
+                    characters=[f"主角（第{number}章推进{act}阶段）"],
+                    twist=f"{act}阶段的转折：旧承诺被重新提起" if number % 3 == 0 else "",
+                    handoff=(
+                        f"第{number}章结尾留下衔接：主角面向下一阶段的选择。"
+                    ),
                 )
             )
         story_spine = {
@@ -142,3 +152,26 @@ class DeterministicFakeProvider:
             "ending_constraint": "全部伏笔在末章前收束，结局呼应第一章的初始条件。",
         }
         return OutlineResult(story_spine=story_spine, chapters=chapters)
+
+    def extract_chapter_state(self, request: ExtractionRequest) -> dict[str, Any]:
+        """Deterministic extraction echoing contract + handoff, for tests."""
+        return {
+            "character_changes": [
+                {
+                    "character": item,
+                    "before": "未知",
+                    "after": f"在第{request.contract.chapter_number}章推进",
+                }
+                for item in (request.contract.characters or [])
+            ],
+            "hooks_status": [
+                {"hook": hook, "status": "planted", "evidence": "按合同埋设"}
+                for hook in request.contract.hooks_to_plant
+            ]
+            + [
+                {"hook": hook, "status": "advanced", "evidence": "按合同推进"}
+                for hook in request.contract.hooks_to_advance
+            ],
+            "twist": request.contract.twist,
+            "next_chapter_hook": request.contract.handoff,
+        }

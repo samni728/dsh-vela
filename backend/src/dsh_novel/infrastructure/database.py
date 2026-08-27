@@ -341,6 +341,43 @@ class ProjectDatabase:
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
+    def recent_deltas(self, before_chapter: int, limit: int = 3) -> list[dict[str, Any]]:
+        """Latest committed chapter deltas (structured core info) before N.
+
+        Each delta carries character_changes / hooks_status / twist extracted
+        from the actual prose — the continuation mechanism reads these instead
+        of only a 500-char digest, so character relationship changes and hook
+        state survive across chapters (the user's original design).
+        """
+        self.ensure_exists()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT delta_json FROM chapter_deltas
+                WHERE chapter_number < ?
+                ORDER BY chapter_number DESC LIMIT ?
+                """,
+                (before_chapter, limit),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            try:
+                data = json.loads(str(row["delta_json"]))
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            result.append(
+                {
+                    "chapter_number": data.get("chapter_number"),
+                    "character_changes": data.get("character_changes") or [],
+                    "hooks_status": data.get("hooks_status") or [],
+                    "twist": data.get("twist") or "",
+                    "next_chapter_hook": data.get("next_chapter_hook") or data.get("handoff") or "",
+                }
+            )
+        return result
+
     def save_context(self, package: ContextPackage) -> None:
         with self.transaction() as connection:
             connection.execute(

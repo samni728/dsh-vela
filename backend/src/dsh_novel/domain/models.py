@@ -20,6 +20,9 @@ class ChapterContract(StrictModel):
     hooks_to_advance: list[str] = Field(default_factory=list)
     handoff: str = ""
     target_words: int = Field(default=3500, ge=100, le=20000)
+    # 章节蓝图扩展：本章涉及的人物关系 + 本章反转/转折点（编排阶段产出）。
+    characters: list[str] = Field(default_factory=list)
+    twist: str = ""
 
 
 class ContextBlock(StrictModel):
@@ -66,6 +69,14 @@ class ChapterDelta(StrictModel):
     handoff: str = ""
     digest: str
     extraction_confidence: float = Field(default=1.0, ge=0, le=1)
+    # 续写核心信息：本章人物关系的真实变化（抽取自正文，非合同回声）。
+    character_changes: list[dict[str, Any]] = Field(default_factory=list)
+    # 伏笔真实状态：{"hook", "status"(planted/advanced/resolved), "evidence"}。
+    hooks_status: list[dict[str, Any]] = Field(default_factory=list)
+    # 本章实际发生的反转/转折。
+    twist: str = ""
+    # 章末钩子：人物当前面对的状态/悬念（下一章续写锚点）。
+    next_chapter_hook: str = ""
 
 
 class QualityIssue(StrictModel):
@@ -102,8 +113,30 @@ class ReviewVerdict(StrictModel):
     scores: ReviewScores | None = None
 
 
+class ChapterStateExtraction(StrictModel):
+    """Structured core information extracted from one chapter's prose.
+
+    Feeds the continuation mechanism: the next chapter's context reads this
+    instead of only a 500-char digest, so character relationship changes and
+    hook status survive across chapters.
+    """
+
+    # {"character": "赵峥", "before": "...", "after": "...", "relation": "..."}
+    character_changes: list[dict[str, Any]] = Field(default_factory=list)
+    # {"hook": "蜡烛上刻着日期", "status": "planted|advanced|resolved", "evidence": "..."}
+    hooks_status: list[dict[str, Any]] = Field(default_factory=list)
+    # 本章反转/转折（无则为空）。
+    twist: str = ""
+    # 章末衔接状态：人物接下来面对什么（下一章的续写锚点）。
+    next_chapter_hook: str = ""
+
+
 class OutlineChapter(StrictModel):
-    """One chapter entry of a generated outline."""
+    """One chapter entry of a generated outline.
+
+    章节蓝图：除了目的/事件/伏笔，还包含本章人物关系与反转点，全部
+    结构化存库，供续写机制读取（人物核心变化 + 蓝图 + 钩子压缩续写）。
+    """
 
     chapter_number: int = Field(ge=1)
     title: str = Field(min_length=1, max_length=200)
@@ -112,6 +145,12 @@ class OutlineChapter(StrictModel):
     hooks_to_plant: list[str] = Field(default_factory=list)
     hooks_to_advance: list[str] = Field(default_factory=list)
     target_words: int = Field(default=3500, ge=100, le=20000)
+    # 本章涉及的人物及其关系/状态（如 "赵峥（壮熊班长，外表钢铁直男）"）。
+    characters: list[str] = Field(default_factory=list)
+    # 本章反转/转折点（可为空）。
+    twist: str = ""
+    # 章末衔接：上一章结尾状态如何导向本章（续写锚点）。
+    handoff: str = ""
 
 
 class OutlineResult(StrictModel):
