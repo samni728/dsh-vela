@@ -402,6 +402,70 @@ def force_rewrite(project_id: str, chapter_number: int) -> dict:
     return result
 
 
+def monitor(project_id: str, target_chapters: int | None = None) -> dict:
+    """Lifecycle monitor: keep the autorun moving until the book is done.
+
+    Runs a poll loop (never calling the model) that:
+      - if autorun is running  -> just waits (serial discipline)
+      - if completed_with_rework (chapters stuck in the rework queue)
+        -> re-submits autorun so the orchestrator retries them
+      - if completed (all chapters committed) -> done
+      - if failed -> reports the error and stops
+    Returns when all target chapters are committed, or after the timeout.
+    This is the master agent's standing life-cycle supervision: instead of
+    waiting for a human to ask, it keeps checking and re-driving the pipeline.
+    """
+    ensure_server()
+    deadline = time.time() + WAIT_TIMEOUT_SECONDS
+    cycles = 0
+    while time.time() < deadline:
+        cycles += 1
+        try:
+            st = status(project_id)
+        except Exception as exc:
+            st = {"ok": False, "state": "error", "last_error": str(exc)}
+        state = st.get("state")
+        committed = sorted(st.get("committed_chapters", []) or [])
+        if target_chapters is None:
+            target_chapters = 10  # project default; status doesn't expose it
+        if len(committed) >= target_chapters:
+            return {
+                "ok": True,
+                "project_id": project_id,
+                "state": "completed",
+                "chapters_committed": committed,
+                "cycles": cycles,
+                "rework_queue": st.get("rework_queue", []),
+            }
+        if state == "failed":
+            return {
+                "ok": False,
+                "project_id": project_id,
+                "state": "failed",
+                "last_error": st.get("last_error"),
+                "chapters_committed": committed,
+            }
+        if state == "error":
+            time.sleep(POLL_INTERVAL_SECONDS)
+            continue
+        if state == "completed_with_rework":
+            # Chapters are stuck in the rework queue: re-drive the pipeline.
+            rework = st.get("rework_queue", [])
+            print(f"[monitor] rework queue {rework} — re-submitting autorun", flush=True)
+            submit(project_id)
+            time.sleep(POLL_INTERVAL_SECONDS)
+            continue
+        # state == "running": just wait; never interfere with the model.
+        time.sleep(POLL_INTERVAL_SECONDS)
+    return {
+        "ok": False,
+        "project_id": project_id,
+        "state": "timeout",
+        "chapters_committed": committed if "committed" in dir() else [],
+        "last_error": f"monitor timed out after {WAIT_TIMEOUT_SECONDS}s",
+    }
+
+
 # --------------------------------------------------------------------------- cli
 
 def main() -> int:
@@ -444,6 +508,13 @@ def main() -> int:
     p_force.add_argument("project_id")
     p_force.add_argument("chapter_number", type=int)
 
+    p_monitor = sub.add_parser(
+        "monitor",
+        help="lifecycle supervision: keep autorun moving until the book is done",
+    )
+    p_monitor.add_argument("project_id")
+    p_monitor.add_argument("--target-chapters", type=int, default=10)
+
     args = parser.parse_args()
     try:
         if args.command == "ensure-server":
@@ -462,6 +533,8 @@ def main() -> int:
             out = reverify(args.project_id, args.chapter)
         elif args.command == "force-rewrite":
             out = force_rewrite(args.project_id, args.chapter_number)
+        elif args.command == "monitor":
+            out = monitor(args.project_id, args.target_chapters)
         else:
             parser.error(f"unknown command: {args.command}")
     except Exception as exc:  # noqa: BLE001 - report any failure as JSON
