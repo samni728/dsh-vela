@@ -433,6 +433,77 @@ novel_report {project_id}              # 自动生成的报告文本
 
 **Master 不读不改正文**：整个循环里 Master Agent 只见到数字与状态——它启动运行、读取分数与队列、调整 policy，但从不读取、也从不改写任何章节正文；正文只在人类明确要求导出/报告时才离开 Sidecar。
 
+## 方案 A：共享端点流水线调度（同模型零争抢）
+
+**何时启用**：当 Master Agent 与写作 Sidecar **共用同一个本地推理端点**时（典型场景：Master 也配置了写作用的那个本地模型）。此时并发会让两边的生成请求在推理服务上排队互踩，表现为明显变慢。解法不是并发而是**严格串行**——流水线。
+
+**判据**：比较 Master 模型端点与 Sidecar `model_endpoint`（`GET /api/v1/capabilities`）。**端点相同**→同模型共用资源，必须走流水线；**端点不同**→互不干扰，可继续用异步长跑。
+
+**流水线语义**（同步逐章，两阶段严格交替）：
+
+```text
+for 章 in 1..N:
+  ① 写作阶段: novel_chapter_run(第N章)     ← 阻塞到该章定稿;此间 Master 模型零请求
+     起草 → 规则审查 → LLM 审稿 → 分数阈值 → 修复定稿(全部在 Sidecar 内,写作模型独占)
+  ② 判定阶段: Master 读该章分数/问题计数     ← 此间写作模型空闲
+     达标 → 下一章;不达标且可救 → 重发该章;不可救 → 记入补写清单
+完成后: Master 汇总全部章节分数,输出评分
+```
+
+**为什么这样就不争抢**：Agent 循环的天然时序是「模型生成→工具执行→模型再生成」。`novel_chapter_run` 是同步调用，工具执行期间 Master 模型不发任何请求——写作阶段与判定阶段在时间上互斥，共享端点的利用率从"互相等待"变成"轮流独占"。
+
+**落地方式（二选一）**：
+
+1. **Master 工具循环**（推荐，任何模型都可当 Master）：判据命中同端点后，Master 用 `novel_chapter_run` 逐章调用代替 `novel_auto_create`，每章收到结果后判定再进下一章。伪代码：
+
+```text
+if capabilities.model_endpoint == 本会话模型端点:
+    for n in 1..target_chapters:
+        res = novel_chapter_run {project_id, chapter_number: n}
+        s = novel_run_status {run_id}      # 读分数与 issue 计数
+        if s.result.overall < threshold and s.result.retryable:
+            novel_run_resume {run_id}       # 同章重写,仍在写作阶段
+        elif s.result.overall < threshold:
+            record_rework(n)                # 进补写清单,继续下一章
+        # 达标 → 直接进入下一章
+else:
+    novel_auto_create {...}                 # 端点不同,并发长跑
+```
+
+2. **流水线驱动脚本**（独立运行，不依赖 Agent 纪律）：`scripts/pipeline_loop.py <project_id> [from] [to]`——严格串行、客户端断连转服务端监视、失败自动恢复，每章打印分数。共享端点时由脚本作"写入泵"，Master（人或任何模型）在脚本结束后统一评分：
+
+```bash
+DSH_NOVEL_ENDPOINT=http://127.0.0.1:17861 python3 scripts/pipeline_loop.py prj_xxxx
+```
+
+**边界提醒**：流水线解决的是"Master 自动调度"的争抢；若用户**主动聊天**占用 Master 模型，争抢仍会发生——生成期间不催、不聊，是共享端点模式的使用纪律。
+
+## Git 版本管理
+
+仓库已建立标签化版本管理，随时可回滚、备份或建分支：
+
+```bash
+# 查看所有版本点与分支
+git tag -l && git branch -a
+
+# 回滚到某个稳定版本(先备份当前工作再回)
+git stash                        # 有未提交改动时先存起来
+git checkout v0.5.0              # 回到该版本点的代码
+
+# 建分支做实验(推荐,不污染 main)
+git checkout -b experiment-xxx   # 基于当前 main 新建
+git push origin experiment-xxx   # 推到远端
+
+# 打备份标签
+git tag backup-2026-08-25        # 当前状态存档
+git push origin --tags
+
+# 查看历史
+git log --oneline --graph
+```
+
+**版本约定**：`main` 为稳定主线；每轮重大特性合入后打语义化标签（`v0.5.0` 为"管理与创作解耦 + 懒迁移修复"稳定点）；实验性改动一律走分支，验证后再合回 main 并打新标签。
+
 ## 开发与测试
 
 ```bash
