@@ -10,7 +10,7 @@ from typing import Any
 
 from dsh_novel.api_models import ProjectCreateRequest
 from dsh_novel.domain import ChapterContract, ChapterDelta, ContextPackage, QualityIssue
-from dsh_novel.errors import ProjectNotFoundError, RunNotFoundError
+from dsh_novel.errors import ChapterNotFoundError, ProjectNotFoundError, RunNotFoundError
 from dsh_novel.util import canonical_json, new_id, sha256_text, utc_now
 
 SCHEMA_VERSION = 3
@@ -619,6 +619,37 @@ class ProjectDatabase:
                 "ORDER BY chapter_number"
             ).fetchall()
         return [int(row["chapter_number"]) for row in rows]
+
+    def uncommit_chapter(self, chapter_number: int) -> None:
+        """Roll a COMMITTED chapter back to PREPARED so a later autorun will
+        re-draft it. History (revisions/deltas/canon_commits) is preserved —
+        only the chapter's committed state and its finalized pointer are reset.
+
+        Used by the master agent's force-rewrite path: reverify may flag a
+        committed chapter as below threshold, and since the orchestrator never
+        re-runs committed chapters, the master agent uncommits it and submits
+        a fresh autorun to get a rewrite.
+        """
+        self.ensure_exists()
+        now = utc_now()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT status FROM chapters WHERE chapter_number = ?",
+                (chapter_number,),
+            ).fetchone()
+            if row is None:
+                raise ChapterNotFoundError(f"chapter {chapter_number} was not found")
+            if row["status"] != "COMMITTED":
+                return  # idempotent: nothing committed to roll back
+            connection.execute(
+                """
+                UPDATE chapters SET status = 'PREPARED', digest = '',
+                    finalized_revision_id = NULL, context_package_id = NULL,
+                    updated_at = ?
+                WHERE chapter_number = ?
+                """,
+                (now, chapter_number),
+            )
 
     def chapter_overview(self) -> list[dict[str, Any]]:
         """chapter_number/status/title rows only — no digest, no prose."""

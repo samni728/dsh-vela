@@ -262,6 +262,24 @@ class NovelService:
             return run
         # 0.5.0: the retry budget comes from the effective per-project policy.
         max_revisions = int(self.effective_policy(db)["max_revisions"])
+        if run["status"] == "PAUSED" and run.get("error_code") == "RETRY_BUDGET_EXHAUSTED":
+            # The retry budget may have been raised since the run paused
+            # (e.g. a master agent bumped max_revisions). If there is still
+            # headroom, roll the run back to FAILED_RETRYABLE so a resume
+            # starts a fresh drafting attempt instead of erroring out.
+            if int(run["attempt"]) < max_revisions:
+                db.update_run(
+                    run_id,
+                    status="FAILED_RETRYABLE",
+                    stage=run["stage"] or "DRAFTING",
+                    error_code=None,
+                    error_message=None,
+                )
+                run = db.run(run_id)
+            else:
+                raise InvalidRunStateError(
+                    f"run {run_id!r} exhausted its retry budget of {max_revisions}"
+                )
         if int(run["attempt"]) >= max_revisions:
             db.update_run(
                 run_id,
@@ -280,6 +298,31 @@ class NovelService:
                 f"run {run_id!r} cannot resume from {run['status']}"
             )
         return self._process_run(db, run_id)
+
+    def force_rewrite(self, project_id: str, chapter_number: int) -> dict[str, Any]:
+        """Uncommit a chapter so a fresh autorun will re-draft it.
+
+        The orchestrator never re-runs committed chapters, so a chapter that
+        committed without a real score (fail-open review) or later fails a
+        re-verification cannot be fixed by re-submitting autorun alone. This
+        rolls the chapter back to PREPARED (history preserved); the master
+        agent then submits a new autorun which picks it up from the pending
+        plan and rewrites it through the full write->review->commit loop.
+        """
+        db = self.database(project_id)
+        db.ensure_exists()
+        db.uncommit_chapter(chapter_number)
+        chapter = db.chapter_overview()
+        row = next((c for c in chapter if int(c["chapter_number"]) == chapter_number), None)
+        return {
+            "project_id": project_id,
+            "chapter_number": chapter_number,
+            "status": row["status"] if row else "UNKNOWN",
+            "message": (
+                f"chapter {chapter_number} uncommitted; submit a fresh autorun "
+                "to rewrite it through the full review gate"
+            ),
+        }
 
     def find_run(self, run_id: str) -> ProjectDatabase:
         if not run_id.startswith("run_"):

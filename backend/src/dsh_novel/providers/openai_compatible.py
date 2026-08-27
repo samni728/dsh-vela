@@ -14,8 +14,10 @@ from dsh_novel.providers.base import (
 )
 from dsh_novel.util import canonical_json
 
-# Output cap for the review call only; verdicts are small JSON objects.
-_REVIEW_MAX_TOKENS = 2048
+# Output cap for the review call only; verdicts are small JSON objects, but
+# the model can waste tokens re-stating the task, so give it generous room
+# (capped by the global model_max_output_tokens in the payload).
+_REVIEW_MAX_TOKENS = 8192
 
 REVIEW_SYSTEM_PROMPT = (
     "你是严格的中文小说审稿编辑，在章节定稿前对照全书蓝图审查单章正文。逐项核对："
@@ -25,7 +27,8 @@ REVIEW_SYSTEM_PROMPT = (
     "本章反转或转折是否落在蓝图规划的位置；"
     "3) 年代质感：器物、称谓、语言风格是否符合故事年代与社会环境；"
     "4) 叙事流畅：视角稳定、节奏合理、无机械重复的对话循环、无整段复述前文、结尾不残缺。"
-    "只输出一个 JSON 对象，禁止输出解释、分析、思考过程或任何标签。JSON 格式："
+    "直接输出一个 JSON 对象。禁止输出任何解释、分析、思考过程、复述任务或标签，"
+    "JSON 必须是回复的全部内容。JSON 格式："
     '{"verdict":"pass或blocked",'
     '"issues":[{"severity":"blocker或warning","type":"问题类型","description":"具体说明"}],'
     '"scores":{"contract_adherence":0到10,"era_authenticity":0到10,"flow":0到10}}。'

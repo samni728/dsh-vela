@@ -29,6 +29,10 @@ class RunNotFoundError(NovelError):
     code = "RUN_NOT_FOUND"
 
 
+class ChapterNotFoundError(NovelError):
+    code = "CHAPTER_NOT_FOUND"
+
+
 class ContextBudgetExceededError(NovelError):
     code = "CONTEXT_BUDGET_EXCEEDED"
 
