@@ -16,9 +16,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dsh_novel.application.quality import (
+    DIALOGUE_STREAM_MIN_RUN,
     inspect_chapter,
     inspect_cross_chapter_exact_repeat,
     inspect_dense_short_line_repeat,
+    inspect_dialogue_stream,
     inspect_truncated_ending,
 )
 from dsh_novel.config import Settings
@@ -517,3 +519,63 @@ def test_openai_review_chapter_raises_runtime_error_when_unreachable() -> None:
     )
     with pytest.raises(RuntimeError):
         provider.review_chapter(request)
+
+
+# ---------------------------------------------------------------------------
+# dialogue_stream: user forbids long stretches of staccato short dialogue
+# ---------------------------------------------------------------------------
+
+
+def _short_dialogue_lines(count: int) -> str:
+    lines = []
+    for i in range(count):
+        lines.append(f"“嗯{i}。”")
+    return "\n\n".join(lines)
+
+
+def test_dialogue_stream_hits_long_short_dialogue_run() -> None:
+    content = _short_dialogue_lines(DIALOGUE_STREAM_MIN_RUN + 2)
+    issues = inspect_dialogue_stream(chapter_number=1, content=content)
+    assert any(issue.issue_type == "dialogue_stream" for issue in issues)
+    assert all(issue.severity == "blocker" for issue in issues)
+
+
+def test_dialogue_stream_ignores_short_run() -> None:
+    content = _short_dialogue_lines(DIALOGUE_STREAM_MIN_RUN - 2)
+    issues = inspect_dialogue_stream(chapter_number=1, content=content)
+    assert not any(issue.issue_type == "dialogue_stream" for issue in issues)
+
+
+def test_dialogue_stream_ignores_normal_prose() -> None:
+    content = "\n\n".join(
+        [
+            "他站在窗边，把帽檐压低，风从界碑那边吹过来，衣摆猎猎作响。",
+            "班长沉默了片刻，才开口说：“今晚轮到我们。”声音低沉，带着岗哨特有的沙哑。",
+            "我点头，把钥匙在掌心掂了掂，铁环发出细碎的响。",
+        ]
+    )
+    issues = inspect_dialogue_stream(chapter_number=1, content=content)
+    assert not any(issue.issue_type == "dialogue_stream" for issue in issues)
+
+
+def test_dialogue_stream_broken_by_narrative_line() -> None:
+    # 连续短对话被一段叙事打断 → 两端各自不足 MIN_RUN，不算流水账
+    content = "\n\n".join(
+        _short_dialogue_lines(DIALOGUE_STREAM_MIN_RUN - 2)
+        .split("\n\n")
+        + ["他转身看向窗外，雪还在下。"]
+        + _short_dialogue_lines(DIALOGUE_STREAM_MIN_RUN - 2).split("\n\n")
+    )
+    issues = inspect_dialogue_stream(chapter_number=1, content=content)
+    assert not any(issue.issue_type == "dialogue_stream" for issue in issues)
+
+
+def test_dialogue_stream_ignores_long_lines() -> None:
+    # 长行（带较多叙述）即使含对话也不算短对话流水账
+    lines = [
+        "他低下头，沉默了很久，才开口说：“当年的事，我一直没跟人提起过。”",
+        "我看着他，想起那天夜里他说的话，心里忽然沉了一下，没有立刻接话。",
+        "窗外的雪越下越大，把整个岗哨都裹进一片寂静里，连脚步声都听不见了。",
+    ] * 5
+    issues = inspect_dialogue_stream(chapter_number=1, content="\n\n".join(lines))
+    assert not any(issue.issue_type == "dialogue_stream" for issue in issues)

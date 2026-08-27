@@ -23,6 +23,18 @@ SHORT_LINE_MIN_CHARS = 6
 SHORT_LINE_MAX_CHARS = 23
 DENSE_SHORT_LINE_WINDOW_SLOTS = 400
 
+# dialogue_stream: a run of consecutive short dialogue lines (each normalized
+# length <= DIALOGUE_STREAM_MAX_CHARS and containing a dialogue marker). When
+# at least DIALOGUE_STREAM_MIN_RUN consecutive paragraphs are such lines, the
+# chapter has degenerated into a staccato back-and-forth ("嗯。""疼吗？"
+# "不疼。"…) instead of prose — flagged as a blocker so the writer rewrites it
+# into richer narrative. Distinct from dense_short_line_repeat, which needs the
+# SAME line to recur; dialogue_stream fires on DIFFERENT short lines piling up.
+DIALOGUE_STREAM_MAX_CHARS = 23
+DIALOGUE_STREAM_MIN_RUN = 8
+# A "dialogue marker": the line looks like speech (quote marks or speech verbs).
+_DIALOGUE_MARKER_RE = re.compile(r"[“”\"'『』「」]|说[：:，]|道[：:，]|问[：:，]")
+
 # cross_chapter_exact_repeat: paragraphs of at least this many normalized chars
 # that appear verbatim in any recent chapter (incident: ch5 lamp description
 # copied word-for-word into ch6).
@@ -144,6 +156,88 @@ def inspect_dense_short_line_repeat(
             )
             break
     return issues
+
+
+def inspect_dialogue_stream(
+    *, chapter_number: int, content: str
+) -> list[QualityIssue]:
+    """Blocker: a run of consecutive short dialogue lines piling up into a
+    staccato back-and-forth instead of prose.
+
+    The user forbids long stretches of choppy dialogue ("嗯。""疼吗？"
+    "不疼。"…) from recurring in the book. Unlike dense_short_line_repeat
+    (which needs the SAME line to recur 3x), this fires when >=8 consecutive
+    paragraphs are short dialogue lines — whatever the actual words are.
+    """
+    paragraphs = _paragraphs(content)
+    issues: list[QualityIssue] = []
+
+    def is_short_dialogue(paragraph: str) -> bool:
+        normalized = normalized_text(paragraph)
+        if len(normalized) > DIALOGUE_STREAM_MAX_CHARS:
+            return False
+        return bool(_DIALOGUE_MARKER_RE.search(paragraph))
+
+    run_start = 0
+    current_run = 0
+    for index, (start, end, paragraph) in enumerate(paragraphs):
+        if is_short_dialogue(paragraph):
+            if current_run == 0:
+                run_start = index
+            current_run += 1
+        else:
+            if current_run >= DIALOGUE_STREAM_MIN_RUN:
+                _append_stream_issue(
+                    issues,
+                    chapter_number=chapter_number,
+                    paragraphs=paragraphs,
+                    run_start=run_start,
+                    run_end=index - 1,
+                )
+            current_run = 0
+    if current_run >= DIALOGUE_STREAM_MIN_RUN:
+        _append_stream_issue(
+            issues,
+            chapter_number=chapter_number,
+            paragraphs=paragraphs,
+            run_start=run_start,
+            run_end=len(paragraphs) - 1,
+        )
+    return issues
+
+
+def _append_stream_issue(
+    issues: list[QualityIssue],
+    *,
+    chapter_number: int,
+    paragraphs: list[tuple[int, int, str]],
+    run_start: int,
+    run_end: int,
+) -> None:
+    start, _, first_text = paragraphs[run_start]
+    _, end, _ = paragraphs[run_end]
+    sample = "\n".join(text for _, _, text in paragraphs[run_start : run_end + 1])[:400]
+    issues.append(
+        QualityIssue(
+            issue_id=new_id("issue"),
+            issue_type="dialogue_stream",
+            severity="blocker",
+            chapter_number=chapter_number,
+            span_start=start,
+            span_end=end,
+            source_hash=sha256_text(sample),
+            instruction=(
+                f"连续 {run_end - run_start + 1} 行都是短促对话，形成对话流水账，"
+                "不符合小说叙事要求。请把这些对话融进更丰富的叙事段落"
+                "（加入动作、神态、环境描写），不要用一问一答的短句堆砌。"
+            ),
+            evidence=[
+                f"dialogue_run:{run_start}-{run_end}",
+                f"lines:{run_end - run_start + 1}",
+                f"sample:{sample[:120]}",
+            ],
+        )
+    )
 
 
 def inspect_cross_chapter_exact_repeat(
@@ -386,6 +480,9 @@ def inspect_chapter(
             )
 
     issues.extend(inspect_dense_short_line_repeat(chapter_number=chapter_number, content=content))
+    issues.extend(
+        inspect_dialogue_stream(chapter_number=chapter_number, content=content)
+    )
     issues.extend(
         inspect_required_event_keywords(
             chapter_number=chapter_number,
