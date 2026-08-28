@@ -44,24 +44,48 @@ from pathlib import Path
 
 # --------------------------------------------------------------------------- config
 
-def _find_workspace() -> Path:
-    """Locate the workspace root (the dir containing novel-data/ and dsh-vela/).
+def _find_repo_root() -> Path:
+    """Locate this checkout without assuming where novel data is stored.
 
-    The script may live at the workspace root or under dsh-vela/scripts/, so
-    walk up from __file__ until both markers are present.
+    ``DSH_NOVEL_REPO`` is useful for packaged launchers. Normal source usage is
+    completely location-independent because this file lives in ``scripts/``.
+    ``DSH_NOVEL_WORKSPACE`` remains a compatibility fallback for old callers.
     """
-    env_ws = os.environ.get("DSH_NOVEL_WORKSPACE")
-    if env_ws:
-        return Path(env_ws)
-    here = Path(__file__).resolve().parent
-    for candidate in (here, *here.parents):
-        if (candidate / "novel-data").is_dir() and (candidate / "dsh-vela").is_dir():
-            return candidate
-    return here
+    env_repo = os.environ.get("DSH_NOVEL_REPO")
+    if env_repo:
+        return Path(env_repo).expanduser().resolve()
+
+    legacy_workspace = os.environ.get("DSH_NOVEL_WORKSPACE")
+    if legacy_workspace:
+        legacy_root = Path(legacy_workspace).expanduser().resolve()
+        nested_repo = legacy_root / "dsh-vela"
+        if (nested_repo / "backend").is_dir():
+            return nested_repo
+        if (legacy_root / "backend").is_dir():
+            return legacy_root
+
+    return Path(__file__).resolve().parents[1]
 
 
-WORKSPACE = _find_workspace()
-DEFAULT_DATA_DIR = WORKSPACE / "novel-data"
+def _config_path() -> Path:
+    """Return the effective config path, preferring the user-level config."""
+    override = os.environ.get("DSH_NOVEL_CONFIG")
+    if override:
+        return Path(override).expanduser()
+
+    user_config = Path.home() / ".dsh-novel" / "config.yml"
+    if user_config.is_file():
+        return user_config
+
+    # Backward compatibility for the former ``cowork/{dsh-vela,novel-data}``
+    # layout. New installs should use the user-level config above.
+    legacy_config = REPO_ROOT.parent / "novel-config.yml"
+    if legacy_config.is_file():
+        return legacy_config
+    return user_config
+
+
+REPO_ROOT = _find_repo_root()
 DEFAULT_PORT = 17861
 BASE_URL = os.environ.get("DSH_NOVEL_BASE_URL", f"http://127.0.0.1:{DEFAULT_PORT}")
 
@@ -76,13 +100,29 @@ def _venv_python() -> str:
     """Prefer the venv python that has dsh_novel installed."""
     candidates = [
         os.environ.get("DSH_NOVEL_VENV_PYTHON"),
-        str(WORKSPACE / "dsh-vela" / "backend" / ".venv" / "bin" / "python3"),
+        str(REPO_ROOT / "backend" / ".venv" / "bin" / "python3"),
         "python3",
     ]
     for cand in candidates:
         if cand and Path(cand).exists():
             return cand
     return "python3"
+
+
+def _dsh_novel_entrypoint() -> Path:
+    return REPO_ROOT / "backend" / ".venv" / "bin" / "dsh-novel"
+
+
+def resolved_paths() -> dict:
+    """Expose migration-sensitive paths without starting the Sidecar."""
+    return {
+        "ok": True,
+        "repo_root": str(REPO_ROOT),
+        "config": str(_config_path()),
+        "venv_python": _venv_python(),
+        "dsh_novel": str(_dsh_novel_entrypoint()),
+        "log": str(Path.home() / ".dsh-novel" / "novel-server.log"),
+    }
 
 
 def _http(method: str, path: str, body: dict | None = None, timeout: float = 30) -> dict:
@@ -122,15 +162,25 @@ def ensure_server() -> dict:
     if _server_up():
         return {"ok": True, "action": "already_running", "base_url": BASE_URL}
     # Start the sidecar as a detached background process. It inherits the
-    # workspace config (novel-config.yml) via DSH_NOVEL_CONFIG so data_dir,
-    # model endpoint and port all resolve consistently.
-    config_path = os.environ.get("DSH_NOVEL_CONFIG", str(WORKSPACE / "novel-config.yml"))
-    if not Path(config_path).is_file():
+    # Use the same user-level config as the CLI so data and code can move
+    # independently. DSH_NOVEL_CONFIG remains an explicit override.
+    config_path = _config_path()
+    if not config_path.is_file():
         return {"ok": False, "error": f"config file not found: {config_path}"}
-    log_path = WORKSPACE / "novel-server.log"
+    entrypoint = _dsh_novel_entrypoint()
+    if not entrypoint.is_file():
+        return {
+            "ok": False,
+            "error": (
+                f"dsh-novel entrypoint not found: {entrypoint}; "
+                "rebuild the venv with `cd backend && uv sync --extra dev`"
+            ),
+        }
+    log_path = Path.home() / ".dsh-novel" / "novel-server.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
-    env["DSH_NOVEL_CONFIG"] = config_path
-    cmd = [_venv_python(), str(WORKSPACE / "dsh-vela" / "backend" / ".venv" / "bin" / "dsh-novel"), "serve"]
+    env["DSH_NOVEL_CONFIG"] = str(config_path)
+    cmd = [_venv_python(), str(entrypoint), "serve"]
     with open(log_path, "ab") as log:
         proc = subprocess.Popen(
             cmd, env=env, stdout=log, stderr=log,
@@ -266,7 +316,7 @@ def reverify(project_id: str, chapter_number: int | None = None) -> dict:
     """
     import sys
 
-    sys.path.insert(0, str(WORKSPACE / "dsh-vela" / "backend" / "src"))
+    sys.path.insert(0, str(REPO_ROOT / "backend" / "src"))
     from dsh_novel.application import NovelService
     from dsh_novel.application.reviewer import overall_score
     from dsh_novel.config import Settings
@@ -384,9 +434,9 @@ def force_rewrite(project_id: str, chapter_number: int) -> dict:
     import subprocess
 
     venv_py = _venv_python()
-    dsh_novel = str(WORKSPACE / "dsh-vela" / "backend" / ".venv" / "bin" / "dsh-novel")
+    dsh_novel = str(_dsh_novel_entrypoint())
     env = dict(os.environ)
-    env.setdefault("DSH_NOVEL_CONFIG", str(WORKSPACE / "novel-config.yml"))
+    env.setdefault("DSH_NOVEL_CONFIG", str(_config_path()))
     proc = subprocess.run(
         [venv_py, dsh_novel, "force-rewrite", project_id, str(chapter_number)],
         capture_output=True, text=True, timeout=60, env=env,
@@ -472,6 +522,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="DSH Novel master-agent scheduler")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("paths", help="show effective repo/config/runtime paths")
     sub.add_parser("ensure-server", help="start the sidecar if it is not running")
 
     p_submit = sub.add_parser("submit", help="start autorun (non-blocking)")
@@ -517,7 +568,9 @@ def main() -> int:
 
     args = parser.parse_args()
     try:
-        if args.command == "ensure-server":
+        if args.command == "paths":
+            out = resolved_paths()
+        elif args.command == "ensure-server":
             out = ensure_server()
         elif args.command == "submit":
             out = submit(args.project_id, args.from_chapter, args.to_chapter)

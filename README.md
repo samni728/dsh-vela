@@ -138,6 +138,30 @@ outline_timeout_seconds: 180  # 大纲生成请求超时秒数
 
 > 安全提示：如果在 config.yml 中写入 `model_api_key` 或 `auth_token`，请把文件权限收紧为仅本人可读：`chmod 600 ~/.dsh-novel/config.yml`。也可以继续只用环境变量传递这两个敏感值，完全不落盘。
 
+### 代码目录迁移
+
+Sidecar 的代码目录与小说数据目录彼此独立。`scripts/novel-agent.py` 和
+`scripts/start-novel-server.sh` 会从脚本自身定位仓库，并默认读取
+`~/.dsh-novel/config.yml`；因此仓库可以移动到 `~/Developer` 等任意位置，
+无需让 `novel-data/` 与 `dsh-vela/` 保持同级。
+
+迁移 checkout 后只需在新目录重建虚拟环境（venv 中的 shebang 和 editable
+安装都包含绝对路径）：
+
+```bash
+cd /new/path/dsh-vela/backend
+uv sync --extra dev
+python ../scripts/novel-agent.py paths
+python ../scripts/novel-agent.py ensure-server
+```
+
+路径覆盖优先级如下：
+
+- `DSH_NOVEL_REPO`：显式指定代码仓库；一般无需设置。
+- `DSH_NOVEL_CONFIG`：显式指定配置文件；默认 `~/.dsh-novel/config.yml`。
+- `DSH_NOVEL_DATA_DIR`：覆盖配置里的 `data_dir`，用于临时切换数据集。
+- `DSH_NOVEL_WORKSPACE`：仅保留给旧调用兼容，不再推荐使用。
+
 ## 2. 先用 HTTP 跑通一章
 
 ```bash
