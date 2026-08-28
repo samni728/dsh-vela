@@ -73,13 +73,17 @@ class AutorunProgress:
 
 
 class AutorunManager:
-    """Per-project single-orchestrator registry and runner."""
+    """Single-lane whole-book orchestrator registry and runner.
+
+    A Sidecar process normally points at one local model server.  Consequently
+    only one project may own the autorun lane at a time.  Status reads never
+    start, resume or otherwise mutate an autorun.
+    """
 
     def __init__(self, service: NovelService, *, max_revisions: int = 3) -> None:
         self.service = service
         self.max_revisions = max(1, int(max_revisions))
         self._registry_lock = threading.Lock()
-        self._locks: dict[str, threading.Lock] = {}
         self._progress: dict[str, AutorunProgress] = {}
         self._threads: dict[str, threading.Thread] = {}
 
@@ -93,8 +97,14 @@ class AutorunManager:
         policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self._registry_lock:
-            lock = self._locks.setdefault(project_id, threading.Lock())
-        with lock:
+            active_project = self._active_project_id_unlocked()
+            if active_project is not None:
+                raise OrchestratorBusyError(
+                    "the serial autorun lane is already owned by "
+                    f"project {active_project!r}",
+                    project_id=active_project,
+                    details={"active_project_id": active_project},
+                )
             db = self.service.database(project_id)
             project = db.project()  # raises ProjectNotFoundError when absent
             target = int(project["target_chapters"])
@@ -104,11 +114,6 @@ class AutorunManager:
                 raise ConfigInvalidError(
                     f"invalid autorun range [{start_from}, {end_to}] "
                     f"for {target} target chapter(s)"
-                )
-            progress = self._progress.get(project_id)
-            if progress is not None and progress.state == "running":
-                raise OrchestratorBusyError(
-                    f"an orchestrator is already running for project {project_id!r}"
                 )
             # 0.5.0: resolve the effective policy (request > stored > settings)
             # and persist it on first set; the whole run reads this one object.
@@ -134,12 +139,12 @@ class AutorunManager:
             )
             self._progress[project_id] = progress
             if not plan:
-                progress.state = "completed"
-                progress.finished_at = utc_now()
                 try:
                     self._write_final_artifacts(project_id)
                 except Exception as exc:
                     progress.last_error = f"artifact export failed: {exc}"
+                progress.state = "completed"
+                progress.finished_at = utc_now()
                 return self.status(project_id)
             progress.current_chapter = plan[0]
             thread = threading.Thread(
@@ -151,6 +156,17 @@ class AutorunManager:
             self._threads[project_id] = thread
             thread.start()
             return self.status(project_id)
+
+    def _active_project_id_unlocked(self) -> str | None:
+        for project_id, progress in self._progress.items():
+            if progress.state == "running":
+                return project_id
+        return None
+
+    def active_project_id(self) -> str | None:
+        """Return the current lane owner without causing any state transition."""
+        with self._registry_lock:
+            return self._active_project_id_unlocked()
 
     def status(self, project_id: str) -> dict[str, Any]:
         db = self.service.database(project_id)
@@ -322,9 +338,11 @@ class AutorunManager:
                     continue
             progress.current_chapter = None
             rework = self.rework_queue(self.service.database(project_id))
+            self._write_final_artifacts(project_id)
+            # Publish a terminal state only after its artifacts are durable;
+            # status polling must never observe "completed" before export.
             progress.state = "completed_with_rework" if rework else "completed"
             progress.finished_at = utc_now()
-            self._write_final_artifacts(project_id)
         except _SystemicModelFailure as exc:
             progress.state = "failed"
             progress.failed_at_chapter = progress.current_chapter
@@ -341,6 +359,15 @@ class AutorunManager:
     ) -> dict[str, Any] | None:
         self._ensure_contracts(project_id, chapter, policy)
         try:
+            db = self.service.database(project_id)
+            latest = db.latest_run_by_chapter().get(chapter)
+            if latest is not None and str(latest["status"]) in {
+                "FAILED_RETRYABLE",
+                "QUALITY_BLOCKED",
+            }:
+                # Preserve the durable run/checkpoint after a process restart
+                # or recoverable failure; do not manufacture a second run.
+                return self.service.resume_run(str(latest["id"]))
             return self.service.run_chapter(
                 project_id=project_id,
                 chapter_number=chapter,

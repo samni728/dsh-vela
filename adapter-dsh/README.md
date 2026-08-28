@@ -38,9 +38,9 @@ The deprecated `requireHandshake` flag is still honored when `handshakeMode` is 
 - `novel_run_status`
 - `novel_run_resume`
 - `novel_manuscript_export`
-- `novel_auto_create` — one-shot fully automatic mode: create project + outline + autorun long haul; optional `policy` override (`score_threshold` / `max_revisions` / `target_words` / `on_chapter_failure`)
+- `novel_auto_create` — idempotent, fast-returning automatic submission; optional stable `idempotency_key` and `policy`
 - `novel_autorun_start` — optional `from_chapter` / `to_chapter` plus the same `policy` override; rework-queue chapters are retried first
-- `novel_autorun_status` — poll until `state` is `completed` or `failed`
+- `novel_autorun_status` — read-only polling until `completed`, `completed_with_rework`, or `failed`
 - `novel_pipeline_status` — zero-prose management snapshot: scores and status only, never chapter content
 - `novel_report`
 
@@ -65,8 +65,8 @@ The Sidecar splits into a **creation plane** (writes, reviews, stores prose) and
 **Recommended loop** (management calls are read-only and concurrency-safe):
 
 ```text
-# start once; policy fields you omit are dropped by the adapter
-res = novel_auto_create {title, premise, target_chapters, policy?}
+# submit once; reuse the same idempotency_key only to recover a lost response
+res = novel_auto_create {title, premise, target_chapters, idempotency_key, policy?}
 project_id = res.result.project_id
 
 # poll (interval >= 5s)
@@ -90,6 +90,12 @@ if p.result.rework_queue is not empty:
 novel_report {project_id}               # generated README report
 novel_manuscript_export {project_id}    # only when prose is actually wanted
 ```
+
+While state is `running`, the only permitted calls are the read-only status
+tools. Do not call `novel_auto_create`, `novel_autorun_start`,
+`novel_chapter_run`, or `novel_run_resume`. `ORCHESTRATOR_BUSY` means “poll the
+reported active project”, never “retry until accepted”. The Sidecar owns one
+global autorun lane and one model lane across outline/write/review/extraction.
 
 ## Development
 

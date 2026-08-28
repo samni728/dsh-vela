@@ -865,7 +865,8 @@ MVP 不建立 UI 目录。若未来确实需要查看运行状态，再增加只
 ### 13.3 并发与写入
 
 - 一个项目同一时刻只有一个 Committer。
-- 读任务可并发，写任务按项目串行。
+- 状态读取可并发且必须无副作用；所有会触发模型的任务在 Sidecar 全局串行，
+  不因项目不同而并发。Master Agent 在 `running` 时只允许轮询状态。
 - 所有写操作携带 expected version。
 - 同一 idempotency key 重放不得产生第二份 revision。
 - Patch 使用 source hash 乐观锁。

@@ -74,4 +74,4 @@ class AutoCreateRequest(APIModel):
     hard_rules: list[str] = Field(default_factory=list)
     target_words: int | None = Field(default=None, ge=100, le=20000)
     policy: PolicyInput | None = None
-
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)

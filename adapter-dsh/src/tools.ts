@@ -69,7 +69,7 @@ export function registerNovelTools(
 
   ctx.tools.register(defineTool({
     name: 'novel_project_status',
-    description: 'Read durable progress, chapter state, warnings, and active run information for one novel project.',
+    description: 'Read-only: inspect durable progress, chapter state, warnings, and active run information. This never starts, retries, resumes, or mutates writing work.',
     parameters: {
       project_id: { type: 'string', required: true, description: 'Project id returned by novel_project_create.' },
     },
@@ -82,13 +82,12 @@ export function registerNovelTools(
 
   ctx.tools.register(defineTool({
     name: 'novel_outline_generate',
-    description: 'Generate the whole-book structured outline (story spine plus per-chapter contracts) for one project with the Sidecar outline agent.',
+    description: 'Generate the whole-book structured outline. This consumes the single serial model lane; never call it while autorun is running.',
     parameters: {
       project_id: { type: 'string', required: true, description: 'Target novel project id.' },
     },
     output: envelopeOutput,
     timeoutMs,
-    isConcurrencySafe: () => true,
     execute: (args, exec) => safeCall(() => sidecar.generateOutline(args.project_id, exec.signal)),
     presentCall: args => ({ card: 'generic', title: `Generate outline for ${args.project_id}`, kind: 'read' }),
   }))
@@ -138,7 +137,7 @@ export function registerNovelTools(
 
   ctx.tools.register(defineTool({
     name: 'novel_run_status',
-    description: 'Read the persisted state and latest checkpoint of a chapter workflow run.',
+    description: 'Read-only: inspect the persisted state and latest checkpoint of a chapter workflow run. This never triggers a retry or another model request.',
     parameters: {
       run_id: { type: 'string', required: true, description: 'Run id returned by novel_chapter_run or project status.' },
     },
@@ -151,7 +150,7 @@ export function registerNovelTools(
 
   ctx.tools.register(defineTool({
     name: 'novel_run_resume',
-    description: 'Resume a paused, interrupted, or retryable persisted novel workflow from its last safe checkpoint.',
+    description: 'Resume only a FAILED_RETRYABLE or QUALITY_BLOCKED run from its checkpoint. If the run is already RUNNING or COMMITTED, the Sidecar returns current state and does not trigger model work.',
     parameters: {
       run_id: { type: 'string', required: true, description: 'Persisted run id to resume.' },
       force_redraft: {
@@ -193,7 +192,7 @@ export function registerNovelTools(
 
   ctx.tools.register(defineTool({
     name: 'novel_auto_create',
-    description: 'One-shot fully automatic mode: create the project, generate the whole-book outline, and start the chapter-by-chapter autorun long haul in a single call. Use this instead of chaining novel_project_create + novel_outline_generate + novel_autorun_start by hand.',
+    description: 'Submit exactly one fully automatic serial novel job and return quickly. Retries with the same idempotency_key reuse the same project. After submission, only poll novel_autorun_status or novel_pipeline_status while state=running; never submit auto/start/chapter/resume again until a recoverable terminal state is reported.',
     parameters: {
       title: { type: 'string', required: true, description: 'Novel title.' },
       premise: { type: 'string', required: true, description: 'Short story premise or creative brief.' },
@@ -205,6 +204,10 @@ export function registerNovelTools(
         description: 'Global story constraints that every chapter must preserve.',
       },
       policy: policyParameter,
+      idempotency_key: {
+        type: 'string',
+        description: 'Stable retry key (8-128 characters). Reuse it for the same book request; change it only when intentionally creating a distinct book.',
+      },
     },
     output: envelopeOutput,
     timeoutMs,
@@ -215,13 +218,14 @@ export function registerNovelTools(
       target_words: args.target_words,
       hard_rules: args.hard_rules,
       policy: compactPolicy(args.policy),
+      idempotency_key: args.idempotency_key,
     }), exec.signal)),
     presentCall: args => ({ card: 'generic', title: `Auto-create novel project: ${args.title}`, kind: 'execute' }),
   }))
 
   ctx.tools.register(defineTool({
     name: 'novel_autorun_start',
-    description: 'Start (or resume) the server-side automatic chapter-by-chapter long run for one project. Already committed chapters are never rewritten; rework-queue chapters are retried first.',
+    description: 'Start one server-side serial autorun only when its status is idle, failed, or completed_with_rework. Never call while any project is running; poll status instead. The Sidecar allows only one active autorun globally.',
     parameters: {
       project_id: { type: 'string', required: true, description: 'Target novel project id.' },
       from_chapter: { type: 'integer', description: 'Optional one-based first chapter to run. Defaults to committed+1.' },
@@ -242,7 +246,7 @@ export function registerNovelTools(
 
   ctx.tools.register(defineTool({
     name: 'novel_autorun_status',
-    description: 'Read autorun progress (state, current chapter, committed count, scores, last error) for one project. Poll repeatedly until state is completed or failed.',
+    description: 'Read-only: poll autorun progress (state, current chapter, committed count, scores, last error). This never starts, retries, resumes, or creates model work.',
     parameters: {
       project_id: { type: 'string', required: true, description: 'Target novel project id.' },
     },
@@ -255,7 +259,7 @@ export function registerNovelTools(
 
   ctx.tools.register(defineTool({
     name: 'novel_pipeline_status',
-    description: 'Read the zero-prose management snapshot for one project: run state, effective policy, per-chapter scores/statuses/word counts, rework queue, and totals. 仅返回分数与状态，不含正文 — manuscript content is never included.',
+    description: 'Read-only zero-prose management snapshot: state, policy, chapter scores/statuses/word counts, rework queue, and totals. It never triggers writing or retry. 仅返回分数与状态，不含正文。',
     parameters: {
       project_id: { type: 'string', required: true, description: 'Target novel project id.' },
     },

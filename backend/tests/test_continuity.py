@@ -40,6 +40,18 @@ def test_outline_includes_character_twist_handoff(tmp_path: Path) -> None:
         assert created.status_code == 200, created.text
         project_id = created.json()["result"]["project_id"]
 
+        # /auto is intentionally non-blocking; the serial autorun thread owns
+        # outline generation while the Master Agent polls read-only status.
+        for _ in range(100):
+            pipeline = client.get(
+                f"/api/v1/projects/{project_id}/pipeline"
+            ).json()["result"]
+            if pipeline["outline_generated"]:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("background outline was not generated")
+
         db_path = tmp_path / "data" / "projects" / project_id / "novel.sqlite3"
         with sqlite3.connect(db_path) as conn:
             contract = conn.execute(

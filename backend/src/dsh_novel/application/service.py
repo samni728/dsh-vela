@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +25,8 @@ from dsh_novel.errors import (
     ConfigInvalidError,
     InvalidRunStateError,
     ModelUnavailableError,
+    OrchestratorBusyError,
+    ProjectNotFoundError,
     QualityGateBlockedError,
     RunNotFoundError,
     VersionConflictError,
@@ -65,9 +70,56 @@ class NovelService:
         # Unified per-chapter attempt budget: applies to resume retries and to
         # the score-threshold rewrite loop alike.
         self.max_revisions = max(1, int(max_revisions))
+        self._execution_registry_lock = threading.Lock()
+        self._execution_locks: dict[tuple[str, int], threading.Lock] = {}
+        self.recovered_interrupted_runs = self._recover_interrupted_runs()
 
     def database(self, project_id: str) -> ProjectDatabase:
         return ProjectDatabase(self.projects_root, project_id)
+
+    def _recover_interrupted_runs(self) -> int:
+        """Reconcile stale RUNNING rows left by a previous Sidecar process."""
+        if not self.projects_root.exists():
+            return 0
+        recovered = 0
+        for project_dir in self.projects_root.iterdir():
+            if not project_dir.is_dir():
+                continue
+            try:
+                recovered += ProjectDatabase(
+                    self.projects_root, project_dir.name
+                ).mark_interrupted_runs()
+            except (ProjectNotFoundError, OSError):
+                continue
+        return recovered
+
+    @contextmanager
+    def _chapter_execution(
+        self, project_id: str, chapter_number: int
+    ) -> Iterator[None]:
+        """Prevent duplicate execution of one chapter inside this Sidecar.
+
+        This is deliberately non-blocking.  A duplicate HTTP/tool request must
+        observe that work is already running and poll its status; silently
+        queueing another draft would hide a retry storm from the Master Agent.
+        """
+        key = (project_id, chapter_number)
+        with self._execution_registry_lock:
+            lock = self._execution_locks.setdefault(key, threading.Lock())
+        if not lock.acquire(blocking=False):
+            raise OrchestratorBusyError(
+                f"chapter {chapter_number} of project {project_id!r} is already running",
+                project_id=project_id,
+                details={
+                    "project_id": project_id,
+                    "chapter_number": chapter_number,
+                    "action": "poll_status",
+                },
+            )
+        try:
+            yield
+        finally:
+            lock.release()
 
     # ------------------------------------------------------------- policy
 
@@ -247,28 +299,35 @@ class NovelService:
         idempotency_key: str | None,
     ) -> dict[str, Any]:
         db = self.database(project_id)
-        contract, package = self.prepare_chapter(
-            project_id, chapter_number, supplied_contract
-        )
-        key = idempotency_key or new_id("idem")
-        run, created = db.create_run(contract, package.package_id, key)
-        if not created:
-            return db.run(run["id"])
-        if db.chapter_content(chapter_number) is not None:
-            db.update_run(
-                run["id"],
-                status="FAILED",
-                stage="VERSION_CONFLICT",
-                error_code=VersionConflictError.code,
-                error_message=f"chapter {chapter_number} is already committed",
+        with self._chapter_execution(project_id, chapter_number):
+            contract, package = self.prepare_chapter(
+                project_id, chapter_number, supplied_contract
             )
-            raise VersionConflictError(f"chapter {chapter_number} is already committed")
-        return self._process_run(db, run["id"])
+            key = idempotency_key or new_id("idem")
+            run, created = db.create_run(contract, package.package_id, key)
+            if not created:
+                return db.run(run["id"])
+            if db.chapter_content(chapter_number) is not None:
+                db.update_run(
+                    run["id"],
+                    status="FAILED",
+                    stage="VERSION_CONFLICT",
+                    error_code=VersionConflictError.code,
+                    error_message=f"chapter {chapter_number} is already committed",
+                )
+                raise VersionConflictError(
+                    f"chapter {chapter_number} is already committed"
+                )
+            return self._process_run(db, run["id"])
 
     def resume_run(self, run_id: str) -> dict[str, Any]:
         db = self.find_run(run_id)
         run = db.run(run_id)
         if run["status"] == "COMMITTED":
+            return run
+        # A retry/resume request is also a status observation while the run is
+        # active.  Never re-enter _process_run() for a RUNNING run.
+        if run["status"] == "RUNNING":
             return run
         # 0.5.0: the retry budget comes from the effective per-project policy.
         max_revisions = int(self.effective_policy(db)["max_revisions"])
@@ -303,11 +362,18 @@ class NovelService:
             raise InvalidRunStateError(
                 f"run {run_id!r} exhausted its retry budget of {max_revisions}"
             )
-        if run["status"] not in {"FAILED_RETRYABLE", "QUALITY_BLOCKED", "RUNNING"}:
+        if run["status"] not in {"FAILED_RETRYABLE", "QUALITY_BLOCKED"}:
             raise InvalidRunStateError(
                 f"run {run_id!r} cannot resume from {run['status']}"
             )
-        return self._process_run(db, run_id)
+        chapter_number = int(run["chapter_number"])
+        with self._chapter_execution(db.project_id, chapter_number):
+            # Re-read after acquiring the lock: another recovery may have
+            # completed between the first status read and this point.
+            current = db.run(run_id)
+            if current["status"] in {"RUNNING", "COMMITTED"}:
+                return current
+            return self._process_run(db, run_id)
 
     def force_rewrite(self, project_id: str, chapter_number: int) -> dict[str, Any]:
         """Uncommit a chapter so a fresh autorun will re-draft it.

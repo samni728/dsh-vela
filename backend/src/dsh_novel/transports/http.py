@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import threading
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -22,13 +23,14 @@ from dsh_novel.application import NovelService
 from dsh_novel.application.orchestrator import AutorunManager
 from dsh_novel.application.reviewer import ChapterReviewer
 from dsh_novel.config import Settings
-from dsh_novel.errors import NovelError
+from dsh_novel.errors import NovelError, OrchestratorBusyError
 from dsh_novel.providers import (
     DeterministicFakeProvider,
     ModelProvider,
     OpenAICompatibleProvider,
+    serialize_provider,
 )
-from dsh_novel.util import new_id
+from dsh_novel.util import canonical_json, new_id, sha256_text
 
 CAPABILITIES = [
     "project.create",
@@ -42,16 +44,19 @@ CAPABILITIES = [
 
 def build_provider(settings: Settings) -> ModelProvider:
     if settings.model_provider == "fake":
-        return DeterministicFakeProvider()
+        return serialize_provider(DeterministicFakeProvider())
     if settings.model_provider == "openai_compatible":
-        return OpenAICompatibleProvider(
-            endpoint=settings.model_endpoint,
-            model=settings.model_name,
-            api_key=settings.model_api_key,
-            timeout_seconds=settings.model_timeout_seconds,
-            max_output_tokens=settings.model_max_output_tokens,
-            review_timeout_seconds=settings.review_timeout_seconds,
-            outline_timeout_seconds=settings.outline_timeout_seconds,
+        return serialize_provider(
+            OpenAICompatibleProvider(
+                endpoint=settings.model_endpoint,
+                model=settings.model_name,
+                api_key=settings.model_api_key,
+                timeout_seconds=settings.model_timeout_seconds,
+                max_output_tokens=settings.model_max_output_tokens,
+                review_timeout_seconds=settings.review_timeout_seconds,
+                outline_timeout_seconds=settings.outline_timeout_seconds,
+                lock_path=settings.data_dir / "runtime" / "model-request.lock",
+            )
         )
     raise ValueError(f"unsupported model provider: {settings.model_provider}")
 
@@ -111,7 +116,7 @@ def create_app(
     provider: ModelProvider | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
-    selected_provider = provider or build_provider(settings)
+    selected_provider = serialize_provider(provider or build_provider(settings))
     service = NovelService(
         projects_root=settings.data_dir / "projects",
         provider=selected_provider,
@@ -120,6 +125,7 @@ def create_app(
         max_revisions=settings.max_revisions,
     )
     orchestrator = AutorunManager(service, max_revisions=settings.max_revisions)
+    auto_request_lock = threading.Lock()
     app = FastAPI(
         title="DSH Novel Sidecar",
         version=__version__,
@@ -129,6 +135,19 @@ def create_app(
     app.state.settings = settings
     app.state.service = service
     app.state.autorun = orchestrator
+
+    def reject_manual_model_work_while_autorun(action: str) -> None:
+        active_project = orchestrator.active_project_id()
+        if active_project is None:
+            return
+        raise OrchestratorBusyError(
+            f"cannot {action} while the serial autorun lane is running; poll status",
+            project_id=active_project,
+            details={
+                "active_project_id": active_project,
+                "action": "poll_status",
+            },
+        )
 
     @app.middleware("http")
     async def authenticate_api(request: Request, call_next):  # type: ignore[no-untyped-def]
@@ -183,6 +202,8 @@ def create_app(
             "protocol_version": PROTOCOL_VERSION,
             "core_version": __version__,
             "provider": selected_provider.name,
+            "model_execution": selected_provider.snapshot(),
+            "recovered_interrupted_runs": service.recovered_interrupted_runs,
         }
 
     @app.get("/api/v1/capabilities")
@@ -197,6 +218,7 @@ def create_app(
                 "llm_review": settings.review_enabled,
                 "outline": True,
                 "autorun": True,
+                "serial_model_execution": True,
             },
         }
 
@@ -214,6 +236,7 @@ def create_app(
     def generate_outline(
         project_id: str, body: OutlineGenerateRequest | None = None
     ) -> dict[str, Any]:
+        reject_manual_model_work_while_autorun("generate an outline")
         body = body or OutlineGenerateRequest()
         result = service.generate_outline(
             project_id, target_words=body.target_words, persist_mode="all"
@@ -245,6 +268,7 @@ def create_app(
         chapter_number: int,
         body: ChapterRunRequest | None = None,
     ) -> dict[str, Any]:
+        reject_manual_model_work_while_autorun("run a chapter manually")
         body = body or ChapterRunRequest()
         result = service.run_chapter(
             project_id=project_id,
@@ -267,6 +291,7 @@ def create_app(
     def resume_run(
         run_id: str, _body: ResumeRunRequest | None = None
     ) -> dict[str, Any]:
+        reject_manual_model_work_while_autorun("resume a run manually")
         result = service.resume_run(run_id)
         return envelope(result=result, run_id=run_id)
 
@@ -308,31 +333,68 @@ def create_app(
 
     @app.post("/api/v1/auto")
     def auto_create(body: AutoCreateRequest) -> dict[str, Any]:
-        created = service.create_project(
-            ProjectCreateRequest(
-                title=body.title,
-                premise=body.premise,
-                target_chapters=body.target_chapters,
-                hard_rules=body.hard_rules,
+        # Stable even when an older Adapter does not send an explicit key.
+        # Identical retries therefore resolve to one durable project instead
+        # of starting several books after a client-side timeout.
+        fingerprint_body = body.model_dump(
+            mode="json", exclude={"idempotency_key"}, exclude_none=True
+        )
+        fingerprint_seed = body.idempotency_key or canonical_json(fingerprint_body)
+        project_id = f"auto_{sha256_text(fingerprint_seed)[:24]}"
+
+        # Keep check/create/start atomic across simultaneous Harness retries.
+        # This lock is held for milliseconds: outline generation now belongs
+        # to the background autorun thread and the endpoint returns quickly.
+        with auto_request_lock:
+            active_project = orchestrator.active_project_id()
+            if active_project is not None and active_project != project_id:
+                raise OrchestratorBusyError(
+                    "the serial autorun lane is already running another project; "
+                    "poll its status instead of submitting new work",
+                    project_id=active_project,
+                    details={
+                        "active_project_id": active_project,
+                        "requested_project_id": project_id,
+                        "action": "poll_status",
+                    },
+                )
+
+            db = service.database(project_id)
+            reused = db.path.is_file()
+            if not reused:
+                service.create_project(
+                    ProjectCreateRequest(
+                        project_id=project_id,
+                        title=body.title,
+                        premise=body.premise,
+                        target_chapters=body.target_chapters,
+                        hard_rules=body.hard_rules,
+                    )
+                )
+
+            # Persist the requested policy (or defaults) before autorun.  The
+            # first chapter's background preparation generates the outline.
+            policy = service.resolve_policy(
+                service.database(project_id),
+                body.policy.model_dump(exclude_none=True) if body.policy else None,
             )
-        )
-        project_id = created["id"]
-        # Persist the requested policy (or the defaults on first set) before
-        # outline + autorun so the whole run reads one effective policy.
-        policy = service.resolve_policy(
-            service.database(project_id),
-            body.policy.model_dump(exclude_none=True) if body.policy else None,
-        )
-        service.generate_outline(
-            project_id,
-            target_words=body.target_words or int(policy["target_words"]),
-        )
-        status = orchestrator.start(project_id, None, None)
+            if body.target_words is not None:
+                policy["target_words"] = body.target_words
+                service.database(project_id).save_policy(policy)
+
+            if active_project == project_id:
+                status = orchestrator.status(project_id)
+            else:
+                status = orchestrator.start(
+                    project_id, None, None, policy=policy
+                )
         return envelope(
             result={
                 "project_id": project_id,
                 "state": status["state"],
                 "autorun": status,
+                "reused": reused,
+                "next_action": "poll_status",
             },
             project_id=project_id,
         )

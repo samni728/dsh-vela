@@ -55,12 +55,16 @@
 
 1. **绝不并发**：同一时刻只允许一个模型请求。
    - autorun 运行时：只能 `status` / `wait`（纯轮询，零模型调用）。
+   - 查询永远不触发启动或恢复；`ORCHESTRATOR_BUSY` 时只查活动项目。
+   - outline / write / review / rewrite / extract 共用一条全局模型通道，
+     不同项目也不能同时 autorun。
    - reverify 只能在 autorun 完全结束后运行（脚本已内置守卫）。
 2. **不要用同步 CLI**：`dsh-novel run-chapter` / `resume` 是同步阻塞的，
    模型生成一章要 15-25 分钟，任何调用方超时都会把 run 卡死在
    RUNNING/DRAFTING。一律用 `novel-agent.py` 的 autorun 驱动。
 3. **不要手动改数据库**：改 runs/chapters 状态绕过状态机会造成
-   不可恢复的悬挂状态。需要重试就重新 `submit`（编排器会从补写队列继续）。
+   不可恢复的悬挂状态。先查状态；仅 `FAILED_RETRYABLE` / `QUALITY_BLOCKED`
+   或 `completed_with_rework` 才恢复。`RUNNING` 只能继续轮询。
 4. **数据目录必须一致**：服务器、CLI、脚本统一读 `novel-config.yml`
    （data_dir=/Users/samni/Desktop/cowork/novel-data）。
    不要用 `~/.dsh-novel/config.yml` 的旧 data_dir。

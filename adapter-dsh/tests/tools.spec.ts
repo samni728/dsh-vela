@@ -30,7 +30,7 @@ describe('registerNovelTools', () => {
     const { definitions, ctx } = collectingContext()
     registerNovelTools(ctx, fakeClient(), 30_000, 20_000)
     const byName = new Map(definitions.map(tool => [tool.name, tool]))
-    expect(byName.get('novel_outline_generate')?.isConcurrencySafe?.({ project_id: 'prj_1' } as never)).toBe(true)
+    expect(byName.get('novel_outline_generate')?.isConcurrencySafe).toBeUndefined()
     expect(byName.get('novel_autorun_status')?.isConcurrencySafe?.({ project_id: 'prj_1' } as never)).toBe(true)
     expect(byName.get('novel_pipeline_status')?.isConcurrencySafe?.({ project_id: 'prj_1' } as never)).toBe(true)
     expect(byName.get('novel_report')?.isConcurrencySafe?.({ project_id: 'prj_1' } as never)).toBe(true)

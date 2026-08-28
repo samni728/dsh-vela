@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -20,6 +23,11 @@ from dsh_novel.util import canonical_json
 # the model can waste tokens re-stating the task, so give it generous room
 # (capped by the global model_max_output_tokens in the payload).
 _REVIEW_MAX_TOKENS = 8192
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 
 EXTRACTION_SYSTEM_PROMPT = (
     "你是中文小说章节状态抽取器。读取一章已定稿正文，抽取续写所需的结构化核心信息。"
@@ -90,6 +98,7 @@ class OpenAICompatibleProvider:
         max_output_tokens: int,
         review_timeout_seconds: float = 120.0,
         outline_timeout_seconds: float = 180.0,
+        lock_path: Path | None = None,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.model = model
@@ -98,6 +107,7 @@ class OpenAICompatibleProvider:
         self.max_output_tokens = max_output_tokens
         self.review_timeout_seconds = review_timeout_seconds
         self.outline_timeout_seconds = outline_timeout_seconds
+        self.lock_path = lock_path
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -107,6 +117,26 @@ class OpenAICompatibleProvider:
 
     def _chat_completion(self, payload: dict[str, Any], timeout_seconds: float) -> str:
         """POST one chat completion and return the message content."""
+        with self._cross_process_gate():
+            return self._chat_completion_unlocked(payload, timeout_seconds)
+
+    @contextmanager
+    def _cross_process_gate(self) -> Iterator[None]:
+        """Coordinate multiple Sidecar/CLI processes sharing one data dir."""
+        if self.lock_path is None or fcntl is None:
+            yield
+            return
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _chat_completion_unlocked(
+        self, payload: dict[str, Any], timeout_seconds: float
+    ) -> str:
         try:
             with httpx.Client(timeout=timeout_seconds) as client:
                 response = client.post(
@@ -247,14 +277,16 @@ class OpenAICompatibleProvider:
         Fail-open: on any error return an empty extraction (service falls back
         to contract-echo deltas) so a long run is never blocked by this step.
         """
+        planned_hooks = "、".join(
+            request.contract.hooks_to_plant + request.contract.hooks_to_advance
+        )
         sections = [
             f"小说：{request.project_title}",
             f"章节：第{request.contract.chapter_number}章《{request.contract.title}》",
             f"章节目的：{request.contract.purpose}",
             f"本章人物蓝图：{'、'.join(request.contract.characters) or '（未提供）'}",
             f"本章反转计划：{request.contract.twist or '（无）'}",
-            f"本章伏笔（种植/推进）："
-            f"{'、'.join(request.contract.hooks_to_plant + request.contract.hooks_to_advance) or '（无）'}",
+            f"本章伏笔（种植/推进）：{planned_hooks or '（无）'}",
         ]
         if request.previous_delta:
             prev_chars = request.previous_delta.get("character_changes") or []

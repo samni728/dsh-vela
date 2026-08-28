@@ -180,7 +180,7 @@ def inspect_dialogue_stream(
 
     run_start = 0
     current_run = 0
-    for index, (start, end, paragraph) in enumerate(paragraphs):
+    for index, (_start, _end, paragraph) in enumerate(paragraphs):
         if is_short_dialogue(paragraph):
             if current_run == 0:
                 run_start = index

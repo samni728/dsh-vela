@@ -317,11 +317,12 @@ curl -X POST http://127.0.0.1:17861/api/v1/auto \
     "premise": "一名档案员发现城市每晚都会忘记一个人",
     "target_chapters": 10,
     "hard_rules": ["每章必须推进一次调查"],
-    "target_words": 4000
+    "target_words": 4000,
+    "idempotency_key": "fog-port-book-v1"
   }'
 ```
 
-一步完成：建项目 → 提纲 agent 生成全书结构化大纲 → 启动 autorun。返回体含 `project_id` 与 `state`。
+该入口只做一次幂等提交并立即返回：建项目 → 启动后台串行 autorun；提纲生成由 autorun 在后台完成。返回体含 `project_id`、`state`、`reused` 与 `next_action=poll_status`。相同 `idempotency_key`（旧客户端未提供时则使用请求内容指纹）的重试始终返回同一个项目，不会复制任务。
 
 ### 提纲 agent
 
@@ -336,7 +337,7 @@ curl -X POST http://127.0.0.1:17861/api/v1/projects/<project_id>/outline \
 
 | 端点 | 作用 |
 |---|---|
-| `POST /api/v1/projects/{id}/autorun` | 启动自动长跑，body 可选 `{"from_chapter":1,"to_chapter":N,"policy":{...}}`（默认 1..target_chapters）；同项目已有 orchestrator 运行中返回 409 |
+| `POST /api/v1/projects/{id}/autorun` | 启动自动长跑，body 可选 `{"from_chapter":1,"to_chapter":N,"policy":{...}}`；整个 Sidecar 全局只允许一个 autorun，已有任何项目运行时返回 409，并给出 `active_project_id` |
 | `GET /api/v1/projects/{id}/autorun` | 查询进度：`{"state":"idle\|running\|completed\|completed_with_rework\|failed","current_chapter","chapters_committed","rework_queue","scores":[{chapter,scores…,verdict}],"last_error"}` |
 | `GET /api/v1/projects/{id}/pipeline` | **管理面零正文快照**（0.5.0）：state、outline_generated、生效 policy、每章分数/状态/字数、补写队列与 totals，绝不返回任何正文，见下文「管理与创作解耦」 |
 | `GET /api/v1/projects/{id}/report` | 返回自动生成的 README.md 报告内容（未生成时 404） |
@@ -345,7 +346,7 @@ curl -X POST http://127.0.0.1:17861/api/v1/projects/<project_id>/outline \
 
 **自愈续跑**：中途模型不可达或进程重启后，重新 POST autorun 会优先重试补写队列中「已尝试但未提交」的章节，再继续写 committed+1 之后的新章，已定稿章节不动。
 
-线程安全：每项目单 orchestrator 锁保证并发 POST 只有一个编排器；数据库写入沿用现有连接模式（每次操作独立 sqlite connection，线程间不共享）。
+串行保证：整个 Sidecar 只有一条 autorun 通道；outline、写稿、审稿、重写、状态抽取共享 `max_concurrency=1` 的模型执行锁。OpenAI-compatible provider 另用 `data_dir/runtime/model-request.lock` 做跨进程互斥，避免 Sidecar、CLI、脚本同时请求本地模型。同一章节还有独立执行锁，重复 `run` 返回忙状态而不排队制造第二份草稿。SQLite 每次操作使用独立且必定关闭的连接。
 
 ### Master Agent 用法（Harness 工具）
 
@@ -355,12 +356,12 @@ curl -X POST http://127.0.0.1:17861/api/v1/projects/<project_id>/outline \
 novel_auto_create(policy?) → 轮询 novel_pipeline_status → completed_with_rework 时对 rework 章节重发 novel_autorun_start(policy?) → novel_report
 ```
 
-1. **一键启动**：调用 `novel_auto_create {title, premise, target_chapters, target_words?, hard_rules?, policy?}`，一步完成建项 + 大纲 + 启动长跑，从返回体取 `project_id`。`policy` 为可选部分覆盖对象（`score_threshold` / `max_revisions` / `target_words` / `on_chapter_failure`），省略的字段适配器不会发送，回退项目已存策略与 Sidecar 默认值。只想先审大纲再开跑时，改用 `novel_project_create` → `novel_outline_generate` → `novel_autorun_start` 的分步组合。
+1. **只提交一次**：调用 `novel_auto_create {title, premise, target_chapters, target_words?, hard_rules?, policy?, idempotency_key?}`，立即取得 `project_id`。同一意图的重试必须复用同一个 key；返回 `state=running` 后禁止再调用 auto/start/chapter/resume。
 2. **轮询至终态**：循环调用 `novel_pipeline_status {project_id}`（并发安全、只读、零正文），直到返回的 `state` 变为 `completed`、`completed_with_rework` 或 `failed`；轮询间隔建议 ≥5 秒，期间可随时读 `totals`、每章分数与补写队列汇报进度。
 3. **补写重发**：`state=completed_with_rework` 时，对 `rework_queue` 中的章节直接重发 `novel_autorun_start {project_id, policy?}`——autorun 会优先重试补写队列章节、再继续新章，已定稿章节不动；可在同一次调用里调整 policy（如降低 `score_threshold`）。随后回到第 2 步继续轮询。
 4. **收取成果**：`state=completed` 后调用 `novel_report {project_id}` 获取自动生成的 README 报告文本（项目元数据 + 每章分数表 + 质量事件摘要）；需要正文时再用 `novel_manuscript_export`（人类动作，见下文「Master 不读不改正文」）。
 
-**错误信封处理指引**：所有工具失败时都返回结构化错误信封（`ok:false` + `error.code/message/retryable`）。当 `error.retryable === true`（如 `ADAPTER_SIDECAR_UNAVAILABLE`、`SIDECAR_TIMEOUT`、模型暂时不可达等）时，Master Agent 应直接重试同一工具调用；对已经产生运行态的长跑工具（`novel_autorun_start`、`novel_chapter_run`），重试即续跑——autorun 会从 committed+1 断点恢复，已定稿章节不会重写，单章级可重试失败也可用 `novel_run_resume` 从最近安全检查点恢复。`retryable === false` 的错误（参数校验、VERSION_CONFLICT 等）不要盲目重试，应修正输入或换路径。
+**状态优先，不盲重试**：任何 timeout/断连后，Master Agent 必须先用已知 `project_id` 查询 `novel_pipeline_status`；若 auto 响应丢失，可用同一 `idempotency_key` 重发一次以取回同一项目。`running` 只轮询；`completed` 导出；`completed_with_rework` 才可重发 `novel_autorun_start`；`failed` 或 Run 的 `FAILED_RETRYABLE/QUALITY_BLOCKED` 在修复故障后才调用 start/resume。`ORCHESTRATOR_BUSY` 的动作永远是查询 `active_project_id`，不是继续提交。进程重启遗留的 `RUNNING` 会自动改为 `FAILED_RETRYABLE/PROCESS_INTERRUPTED`，不会永久假运行。
 
 ### config 新 key（0.4.0）
 

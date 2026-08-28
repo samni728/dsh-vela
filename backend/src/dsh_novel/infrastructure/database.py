@@ -207,6 +207,19 @@ class ProjectDatabase:
         return connection
 
     @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        """Read/write connection scope that always releases SQLite handles."""
+        connection = self.connect()
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         connection = self.connect()
         try:
@@ -221,7 +234,7 @@ class ProjectDatabase:
 
     def migrate(self) -> None:
         self.project_dir.mkdir(parents=True, exist_ok=True)
-        with self.connect() as connection:
+        with self.connection() as connection:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations "
                 "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
@@ -241,7 +254,7 @@ class ProjectDatabase:
 
     def project(self) -> dict[str, Any]:
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             row = connection.execute("SELECT * FROM projects LIMIT 1").fetchone()
             if row is None:
                 raise ProjectNotFoundError(f"project {self.project_id!r} is not initialized")
@@ -263,7 +276,7 @@ class ProjectDatabase:
 
     def status(self) -> dict[str, Any]:
         result = self.project()
-        with self.connect() as connection:
+        with self.connection() as connection:
             result["chapters"] = [
                 dict(row)
                 for row in connection.execute(
@@ -319,7 +332,7 @@ class ProjectDatabase:
 
     def contract(self, chapter_number: int) -> ChapterContract | None:
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             row = connection.execute(
                 "SELECT contract_json FROM chapter_contracts WHERE chapter_number = ?",
                 (chapter_number,),
@@ -328,7 +341,7 @@ class ProjectDatabase:
 
     def recent_chapters(self, before_chapter: int, limit: int = 3) -> list[dict[str, Any]]:
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 """
                 SELECT c.chapter_number, c.digest, r.content
@@ -350,7 +363,7 @@ class ProjectDatabase:
         state survive across chapters (the user's original design).
         """
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 """
                 SELECT delta_json FROM chapter_deltas
@@ -431,7 +444,7 @@ class ProjectDatabase:
 
     def run(self, run_id: str) -> dict[str, Any]:
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         if row is None:
             raise RunNotFoundError(f"run {run_id!r} was not found")
@@ -479,6 +492,32 @@ class ProjectDatabase:
                     run_id,
                 ),
             )
+
+    def mark_interrupted_runs(self) -> int:
+        """Turn process-local RUNNING markers into explicit recoverable state.
+
+        Autorun workers are daemon threads and cannot survive a Sidecar process
+        restart.  Leaving their database rows as RUNNING would make the Master
+        Agent wait forever or incorrectly resume a supposedly active run.
+        """
+        self.ensure_exists()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE runs
+                SET status = 'FAILED_RETRYABLE',
+                    error_code = 'PROCESS_INTERRUPTED',
+                    error_message = ?,
+                    updated_at = ?
+                WHERE status = 'RUNNING'
+                """,
+                (
+                    "Sidecar stopped while this run was active; "
+                    "resume from checkpoint",
+                    utc_now(),
+                ),
+            )
+            return int(cursor.rowcount)
 
     def save_draft(self, run_id: str, chapter_number: int, content: str) -> str:
         revision_id = new_id("rev")
@@ -613,7 +652,7 @@ class ProjectDatabase:
 
     def chapter_content(self, chapter_number: int) -> str | None:
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             row = connection.execute(
                 """
                 SELECT r.content FROM chapters c
@@ -634,7 +673,7 @@ class ProjectDatabase:
     def project_policy(self) -> dict[str, Any]:
         """Stored raw policy dict; empty when the project never set one."""
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             row = connection.execute(
                 "SELECT policy_json FROM projects LIMIT 1"
             ).fetchone()
@@ -650,7 +689,7 @@ class ProjectDatabase:
 
     def committed_chapter_numbers(self) -> list[int]:
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 "SELECT chapter_number FROM chapters WHERE status = 'COMMITTED' "
                 "ORDER BY chapter_number"
@@ -699,7 +738,7 @@ class ProjectDatabase:
     def chapter_overview(self) -> list[dict[str, Any]]:
         """chapter_number/status/title rows only — no digest, no prose."""
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 "SELECT chapter_number, status, title FROM chapters "
                 "ORDER BY chapter_number"
@@ -709,7 +748,7 @@ class ProjectDatabase:
     def attempted_chapter_numbers(self) -> list[int]:
         """Chapters with at least one run (committed or not)."""
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 "SELECT DISTINCT chapter_number FROM runs ORDER BY chapter_number"
             ).fetchall()
@@ -718,7 +757,7 @@ class ProjectDatabase:
     def chapter_attempts(self) -> dict[int, int]:
         """Highest run attempt per chapter (0 when never attempted)."""
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 "SELECT chapter_number, MAX(attempt) AS max_attempt FROM runs "
                 "GROUP BY chapter_number"
@@ -728,7 +767,7 @@ class ProjectDatabase:
     def chapter_word_counts(self) -> dict[int, int]:
         """Character count of the finalized content per committed chapter."""
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 """
                 SELECT c.chapter_number AS chapter_number, LENGTH(r.content) AS chars
@@ -745,7 +784,7 @@ class ProjectDatabase:
     def latest_run_by_chapter(self) -> dict[int, dict[str, Any]]:
         """Most recent run summary per chapter (for rework-queue reasons)."""
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 "SELECT chapter_number, status, attempt, error_code, error_message "
                 "FROM runs ORDER BY rowid ASC"
@@ -762,7 +801,7 @@ class ProjectDatabase:
         returned, in insertion order, with descriptions bounded for prompting.
         """
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 "SELECT issue_json FROM review_issues WHERE run_id = ? ORDER BY rowid",
                 (run_id,),
@@ -790,7 +829,7 @@ class ProjectDatabase:
     def latest_review_by_chapter(self) -> dict[int, dict[str, Any]]:
         """Most recent review record per chapter across all runs."""
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 "SELECT chapter_number, review_json FROM runs "
                 "WHERE review_json IS NOT NULL AND review_json != '' "
@@ -806,7 +845,7 @@ class ProjectDatabase:
     def quality_event_summary(self) -> list[dict[str, Any]]:
         """Per-chapter quality issue counts grouped by severity and type."""
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 """
                 SELECT chapter_number, issue_json
@@ -833,7 +872,7 @@ class ProjectDatabase:
 
     def export(self, export_format: str) -> str:
         self.ensure_exists()
-        with self.connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 """
                 SELECT c.chapter_number, c.title, r.content FROM chapters c
